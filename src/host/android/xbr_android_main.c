@@ -117,6 +117,17 @@ int SDL_main(int argc, char *argv[])
     }
     xbr_android_log_start("xboxrecomp", s_log_path);
 
+    /* A relative RECOMP_STATUS_BMP (the scanout snapshot of xbr_stats.c)
+     * goes beside the log, where `adb pull` and the launcher can reach it. */
+    {
+        const char *bmp = getenv("RECOMP_STATUS_BMP");
+        if (bmp && *bmp && bmp[0] != '/') {
+            char full[1200];
+            snprintf(full, sizeof full, "%s/%s", logdir, bmp);
+            setenv("RECOMP_STATUS_BMP", full, 1);
+        }
+    }
+
     printf("[BOOT] xboxrecomp Android host (arm64: %s, API %d at build)\n",
 #if defined(__aarch64__)
            "yes",

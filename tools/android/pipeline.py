@@ -49,7 +49,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from tools.android import compat, iso, native, project, xbe_info      # noqa: E402
+from tools.android import apk, compat, iso, native, project, xbe_info      # noqa: E402
 
 STAGES = ["intake", "analyze", "recompile", "project", "host", "native", "apk", "verify"]
 
@@ -291,6 +291,26 @@ def stage_native(ctx):
     return result
 
 
+def stage_apk(ctx):
+    try:
+        r = apk.build(ctx.work, run=_native_run(ctx), log=ctx.log)
+    except (apk.ApkError, native.NativeError) as e:
+        raise StageError(str(e))
+    return {"apk": r["apk"], "size": r["size"], "sha256": r["sha256"],
+            "generated_key": r["signing"].get("generated")}
+
+
+def stage_verify(ctx):
+    try:
+        r = apk.verify(ctx.work, log=ctx.log)
+    except apk.ApkError as e:
+        raise StageError(str(e))
+    finally:
+        compat.write(ctx.work)
+    return {"abis": r["abis"], "game_files": r["game_files"],
+            "signature": (r.get("signature") or {}).get("schemes")}
+
+
 def _not_yet(name):
     def stage(ctx):
         raise StageError("stage %r is not implemented yet in this build of the pipeline" % name)
@@ -304,8 +324,8 @@ STAGE_FUNCS = {
     "project": stage_project,
     "host": stage_host,
     "native": stage_native,
-    "apk": _not_yet("apk"),
-    "verify": _not_yet("verify"),
+    "apk": stage_apk,
+    "verify": stage_verify,
 }
 
 
@@ -318,7 +338,8 @@ def run_stages(ctx, stages):
         try:
             result = STAGE_FUNCS[name](ctx) or {}
             entry.update(status="ok", result=result)
-        except (StageError, iso.IsoError, project.ProjectError, native.NativeError) as e:
+        except (StageError, iso.IsoError, project.ProjectError, native.NativeError,
+                apk.ApkError) as e:
             entry.update(status="failed", error=str(e))
             ctx.log("stage %s FAILED: %s" % (name, e))
         except Exception as e:      # a bug: keep the traceback in the log

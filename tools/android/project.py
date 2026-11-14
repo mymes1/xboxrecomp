@@ -23,7 +23,9 @@ import shutil
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TEMPLATE = os.path.join(ROOT, "templates", "xbr-game", "native", "CMakeLists.txt")
+APP_TEMPLATE = os.path.join(ROOT, "templates", "xbr-game", "app")
 PROFILES = os.path.join(ROOT, "tools", "android", "games")
+LOCK = os.path.join(ROOT, "tools", "android", "deps.lock.json")
 
 DEFAULTS = {
     "schema": 1,
@@ -145,6 +147,98 @@ def config_c(cfg):
     return "\n".join(lines)
 
 
+def _android_string(s):
+    """A value for res/values/strings.xml: XML-escaped, then aapt's own escapes."""
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    s = s.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+    if s[:1] in ("@", "?"):
+        s = "\\" + s
+    return s
+
+
+def _sdl2_java_dir():
+    deps = os.environ.get("XBOXRECOMP_ANDROID_DEPS", os.path.join(ROOT, "build", "android-deps"))
+    src = os.environ.get("XBOXRECOMP_SDL2_DIR") or os.path.join(deps, "src", "SDL2")
+    d = os.path.join(src, "android-project", "app", "src", "main", "java", "org", "libsdl", "app")
+    if not os.path.isdir(d):
+        raise ProjectError("SDL2's Java sources not found at %s (fetch_deps.py --only git)" % d)
+    return d
+
+
+def generate_app(work, cfg, xbe_report, log=print):
+    """<work>/project/app: the Gradle project of the per-game APK.
+
+    Native libraries (src/main/jniLibs) and game files (src/main/assets/game)
+    are filled in by the apk stage, after the native build."""
+    with open(LOCK, encoding="utf-8") as f:
+        lock = json.load(f)
+    app = os.path.join(work, "project", "app")
+    keep_signing = os.path.join(app, "signing")
+    tokens = {
+        "@@AGP_VERSION@@": lock["gradle"]["android_gradle_plugin"],
+        "@@GRADLE_URL@@": lock["gradle"]["url"].replace(":", "\\:"),
+        "@@GRADLE_SHA256@@": lock["gradle"]["sha256"],
+        "@@COMPILE_SDK@@": str(lock["android"]["compile_sdk"]),
+        "@@BUILD_TOOLS@@": lock["android"]["build_tools"],
+        "@@NDK_VERSION@@": lock["android"]["ndk"]["revision"],
+        "@@APP_NAME@@": _android_string(cfg["app_name"]),
+    }
+    # Regenerated each time, except the signing key: an APK update must be
+    # signed with the key the installed one was.
+    if os.path.isdir(app):
+        for name in os.listdir(app):
+            if name in ("signing", ".gradle"):
+                continue
+            p = os.path.join(app, name)
+            shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
+    for root, _dirs, files in os.walk(APP_TEMPLATE):
+        rel = os.path.relpath(root, APP_TEMPLATE)
+        dst_dir = os.path.normpath(os.path.join(app, rel))
+        os.makedirs(dst_dir, exist_ok=True)
+        for n in files:
+            with open(os.path.join(root, n), encoding="utf-8") as f:
+                text = f.read()
+            for k, v in tokens.items():
+                text = text.replace(k, v)
+            with open(os.path.join(dst_dir, n), "w", encoding="utf-8") as f:
+                f.write(text)
+    java = os.path.join(app, "app", "src", "main", "java", "org", "libsdl", "app")
+    shutil.copytree(_sdl2_java_dir(), java)
+    with open(os.path.join(app, "xbr_game.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+
+    # Launcher icon and art from the XBE's title image, when it has one.
+    from tools.android import icons, xbe_info
+    image = None
+    xbe = os.path.join(work, "analysis", "default.xbe")
+    if os.path.exists(xbe):
+        try:
+            _rep, image = xbe_info.analyze(xbe)
+        except Exception as e:      # the icon is cosmetic; say why and go on
+            log("title image not decoded (%s); default icon" % e)
+    res = os.path.join(app, "app", "src", "main", "res")
+    icons.write_icons(res, image, log=log)
+    xbr_assets = os.path.join(app, "app", "src", "main", "assets", "xbr")
+    os.makedirs(xbr_assets, exist_ok=True)
+    if image:
+        icons.write_art(os.path.join(xbr_assets, "title.png"), image)
+    summary = {}
+    try:
+        with open(os.path.join(work, "reports", "recomp_summary.json"), encoding="utf-8") as f:
+            summary = json.load(f)
+    except (OSError, ValueError):
+        pass
+    with open(os.path.join(xbr_assets, "build_info.json"), "w", encoding="utf-8") as f:
+        json.dump({"title": cfg["title"], "title_id": cfg["title_id"],
+                   "functions": summary.get("translated"),
+                   "xbe_sha256": xbe_report.get("sha256"),
+                   "package": cfg["package"]}, f, indent=2)
+    log("app project: %s (package %s, minSdk %d, targetSdk %d, SDL Java from the pinned SDL2)"
+        % (app, cfg["package"], cfg["android"]["min_sdk"], cfg["android"]["target_sdk"]))
+    return app
+
+
 def generate(work, xbe_report, profile_path=None, log=print):
     native = os.path.join(work, "project", "native")
     gen = os.path.join(native, "gen")
@@ -160,6 +254,7 @@ def generate(work, xbe_report, profile_path=None, log=print):
     with open(os.path.join(game, "xbr_game_config.c"), "w", encoding="utf-8") as f:
         f.write(config_c(cfg))
     overrides = sorted(n for n in os.listdir(game) if n.endswith(".c") and n != "xbr_game_config.c")
+    generate_app(work, cfg, xbe_report, log=log)
     log("project: %s (%s), package %s, %d MB RAM, %d title env defaults%s" % (
         cfg["title"], cfg["title_id"], cfg["package"], cfg["total_ram_mb"], len(cfg["env"]),
         (", overrides: " + ", ".join(overrides)) if overrides else ""))

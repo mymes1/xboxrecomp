@@ -15,13 +15,15 @@ source build/android-deps/android-env.sh
 |---|---|---|---|
 | Android NDK | r27d `27.3.13750724` (LTS) | sdkmanager checks Google's manifest checksum; `source.properties` revision read back | arm64 compiler, sysroot, `glslc` |
 | Android SDK | `platforms;android-35`, `build-tools;35.0.0`, `cmake;3.31.5` | same | compileSdk/targetSdk 35, aapt2, apksigner, zipalign |
-| SDK command-line tools | `13114758` | SHA-256 of the zip (only fetched when no SDK has the pinned packages) | sdkmanager |
+| SDK command-line tools | `15859902` | SHA-256 of the zip as published on developer.android.com/studio (only fetched when no SDK has the pinned packages) | sdkmanager |
 | JDK | Temurin 17 | `actions/setup-java` / host package | Gradle |
-| Gradle | 8.11.1 | SHA-256 of the distribution (also in `gradle-wrapper.properties`) | APK build |
+| Gradle | 8.11.1 | SHA-256 of the distribution, equal to Gradle's published `.sha256` (also in the generated `gradle-wrapper.properties`) | APK build |
 | Android Gradle Plugin | 8.7.3 | Gradle resolves it from Google Maven by exact version | APK build |
 | SDL2 | `release-2.32.10` = `5d249570393f…` | git commit id compared after checkout | window, Vulkan surface, input, audio, `SDLActivity` |
 | Vulkan-Headers | `v1.3.296` = `29f979ee5aa5…` | commit id | Linux builds of the Vulkan back end (Android uses the NDK's headers) |
 | extract-xiso | `build-202609111233` = `3f5b62cfe68f…` | commit id | optional second extractor, test-image creation |
+| bionic headers (dev only) | aosp-mirror/platform_bionic `731631f30009…`, sparse `libc/include` + kernel uapi | commit id | compile-only API-26 check where no NDK can be installed (`native.py --mode check`); never linked |
+| liblog headers (dev only) | LineageOS/android_system_logging `336e1707c825…`, sparse `liblog/include` | commit id | `<android/log.h>` for the same check |
 | glslangValidator | 11.7.0 (npm `glslang-validator-prebuilt-predownloaded@0.0.2`) | SHA-256 + npm sha512 integrity | regenerating committed SPIR-V on x86-64 Linux |
 | capstone, cmake, ninja | 5.0.9, 3.31.6, 1.13.0 | `pip --require-hashes` | disassembler, build tools |
 | pytest & co, pefile, ziglang | see `requirements-dev.txt` | `pip --require-hashes` | tests, ARM64 cross-compile checks |

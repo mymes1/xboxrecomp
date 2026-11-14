@@ -61,12 +61,16 @@ def build(work):
         evidence["Compiled"] = "reports/native_build.json"
     on_device = runtime and str(runtime.get("platform", "")).startswith("android-")
     if level == "Compiled" and on_device and runtime.get("entry_reached"):
+        # Where it ran is part of the evidence: a device, or an emulator
+        # running the arm64 code under ARM translation.
+        where = "%s, %s" % ((runtime.get("device") or {}).get("model") or "device",
+                            runtime.get("execution") or "?")
         level = "Runtime initialized"
-        evidence["Runtime initialized"] = runtime.get("log", "reports/runtime_test.json")
+        evidence["Runtime initialized"] = "%s (%s)" % (runtime.get("log", "reports/runtime_test.json"), where)
         drew = runtime.get("flips", 0) > 0 or runtime.get("display_changes", 0) > 0
         if drew and not runtime.get("crash"):
             level = "Game booted"
-            evidence["Game booted"] = runtime.get("display_image") or "reports/runtime_test.json"
+            evidence["Game booted"] = "%s (%s)" % (runtime.get("display_image") or "reports/runtime_test.json", where)
 
     unimpl = []
     if summary:
@@ -173,8 +177,8 @@ def to_markdown(r):
         out.append("")
     rt = r.get("runtime_test")
     if rt:
-        out.append("## Runtime test on %s" % rt.get("platform", "?"))
-        for k in ("device", "entry_reached", "flips", "display_changes", "exit"):
+        out.append("## Runtime test on %s (%s)" % (rt.get("platform", "?"), rt.get("execution", "?")))
+        for k in ("device", "entry_reached", "flips", "display_changes", "exit", "selftest"):
             if k in rt:
                 out.append("- %s: %s" % (k, rt.get(k)))
         for line in rt.get("crash", [])[:12]:

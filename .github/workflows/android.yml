@@ -36,6 +36,11 @@ on:
         description: "SHA-256 of that image (required with iso_url)"
         required: false
         default: ""
+      upload_apk:
+        description: "Also upload the APK and native libraries. They contain the game (code and files): on a public repository, anyone signed in to GitHub can download artifacts."
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -70,8 +75,16 @@ jobs:
             build/android-deps/host-sdl2
           key: android-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/android/deps.lock.json') }}
 
-      - name: Bootstrap pinned dependencies (verified)
-        run: bash tools/android/bootstrap.sh --no-sdk --no-gradle --dev
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('tools/android/deps.lock.json', 'templates/xbr-game/app/**/*.gradle') }}
+
+      - name: Bootstrap pinned dependencies (verified, Gradle included)
+        run: bash tools/android/bootstrap.sh --no-sdk --dev
 
       - name: Check the runner's NDK against the pin
         run: |
@@ -96,10 +109,12 @@ jobs:
           python3 -m tools.android.testtitle.build
           echo "$TESTTITLE_SHA256  build/testtitle/xbrtest.iso" | sha256sum -c -
 
-      - name: "Pipeline: intake -> analyze -> recompile -> project -> host -> native (NDK)"
+      - name: "Pipeline: intake -> analyze -> recompile -> project -> host -> native (NDK) -> apk -> verify"
+        env:
+          JAVA_HOME: ${{ env.JAVA_HOME_17_X64 }}
         run: |
           python3 -m tools.android.pipeline run --source build/testtitle/xbrtest.iso \
-            --sha256 "$TESTTITLE_SHA256" --work build/games/xbrtest --to native \
+            --sha256 "$TESTTITLE_SHA256" --work build/games/xbrtest --to verify \
             --native-mode ndk --ndk "$XBOXRECOMP_NDK" --host-seconds 20
 
       - name: Report
@@ -116,7 +131,54 @@ jobs:
             build/games/xbrtest/reports
             build/games/xbrtest/out
             build/games/xbrtest/project/xbr_game.json
+            build/games/xbrtest/game_manifest.json
             build/games/xbrtest/pipeline_state.json
+          if-no-files-found: warn
+
+  emulator:
+    name: test-title APK on an Android emulator (arm64 code under ARM translation)
+    needs: android-arm64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xbrtest-android-arm64
+          path: build/games/xbrtest
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run the APK (x86_64 API 30 image; its ARM translation runs arm64-v8a apps)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: python3 -m tools.android.device_run --work build/games/xbrtest --seconds 90 || echo "device run reported a failure"
+
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m tools.android.ci_report --work build/games/xbrtest --name emulator --post
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xbrtest-emulator
+          path: build/games/xbrtest/reports
           if-no-files-found: warn
 
   linux-arm64:
@@ -206,9 +268,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Bootstrap pinned dependencies (verified)
+      - name: Bootstrap pinned dependencies (verified, Gradle included)
         if: steps.src.outputs.have == '1'
-        run: bash tools/android/bootstrap.sh --no-sdk --no-gradle --dev
+        run: bash tools/android/bootstrap.sh --no-sdk --dev
 
       - name: Host SDL2 (pinned source)
         if: steps.src.outputs.have == '1'
@@ -219,10 +281,12 @@ jobs:
 
       - name: "Pipeline on your image"
         if: steps.src.outputs.have == '1'
+        env:
+          JAVA_HOME: ${{ env.JAVA_HOME_17_X64 }}
         run: |
           want=$(python3 -c "import json;print(json.load(open('tools/android/deps.lock.json'))['android']['ndk']['revision'])")
           python3 -m tools.android.pipeline run --source "$ISO_URL" --sha256 "$ISO_SHA256" \
-            --work build/games/user --to native --native-mode ndk --ndk "$ANDROID_HOME/ndk/$want" \
+            --work build/games/user --to verify --native-mode ndk --ndk "$ANDROID_HOME/ndk/$want" \
             --host-seconds 60
 
       - name: Report
@@ -231,15 +295,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 -m tools.android.ci_report --work build/games/user --name user-title --post
 
-      # Reports and libraries only: the extracted game files and the image
-      # never leave the runner.
+      # Reports only by default: the image, the extracted files, the native
+      # libraries (recompiled game code) and the APK (all of it) stay on the
+      # runner unless upload_apk is set.
       - uses: actions/upload-artifact@v4
         if: always() && steps.src.outputs.have == '1'
         with:
           name: user-title-reports
           path: |
             build/games/user/reports
-            build/games/user/out
             build/games/user/project/xbr_game.json
             build/games/user/pipeline_state.json
           if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: success() && steps.src.outputs.have == '1' && inputs.upload_apk
+        with:
+          name: user-title-apk
+          path: build/games/user/out
+          retention-days: 7
+          if-no-files-found: error

@@ -321,6 +321,9 @@ def build_ndk(work, run=_default_run, ndk=None, allow_other_ndk=False, build_typ
         "CMAKE_TOOLCHAIN_FILE": os.path.join(ndk_dir, "build", "cmake", "android.toolchain.cmake"),
         "ANDROID_ABI": "arm64-v8a",
         "ANDROID_PLATFORM": "android-%d" % api,
+        # 16 KB ELF alignment for every library (SDL2 too): loads on 4 KB-
+        # and 16 KB-page devices, as Google Play requires for Android 15+.
+        "ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES": "ON",
         "CMAKE_BUILD_TYPE": build_type,
         "XBR_TOOLKIT_DIR": ROOT,
         "XBR_SDL2_SOURCE_DIR": sdl2_source(),
@@ -347,6 +350,9 @@ def build_ndk(work, run=_default_run, ndk=None, allow_other_ndk=False, build_typ
             problems.append("%s is %s %s, not ELF64 aarch64" % (n, s["class"], s["machine"]))
         if s["exec_stack"]:
             problems.append("%s asks for an executable stack" % n)
+        if (s["load_alignment"] or 0) < 16384:
+            problems.append("%s segments are %s-aligned; 16 KB-page devices need 16384"
+                            % (n, s["load_alignment"]))
         missing = [k for k, v in s["symbols_present"].items() if not v]
         if missing:
             problems.append("%s lacks %s" % (n, ", ".join(missing)))
