@@ -341,6 +341,62 @@ int main(int argc, char **argv)
         free(big);
     }
 
+    /*
+     * 7. [android-port] RECOMP_WHOLE_WINDOW=1 holds the whole guest window.
+     *
+     * Run as its own test (CMakeLists sets the variable). Every window maps,
+     * and the gaps between them stay ours: a gap faults on access, and the
+     * host cannot hand it to anyone else. Without this, an Android app
+     * process -- whose ART heap and thread stacks sit just above a fresh
+     * mapping -- had the contiguous window and every device aperture fail,
+     * and a title's contiguous buffer was written into foreign memory.
+     */
+    {
+        const char *ww = getenv("RECOMP_WHOLE_WINDOW");
+        if (ww && ww[0] == '1') {
+            BOOL ok7 = xbox_MemoryLayoutInit(xbe, n);
+            check(ok7, "init succeeds with RECOMP_WHOLE_WINDOW=1", NULL);
+            if (ok7) {
+                unsigned char *b = (unsigned char *)xbox_GetMemoryBase();
+                const struct { uint32_t va; const char *what; } held[] = {
+                    { 0x80000000u, "contiguous window at 0x80000000" },
+                    { 0x80010000u, "kernel page at 0x80010000" },
+                    { 0xF0000000u, "tiled aperture at 0xF0000000" },
+                    { 0xFD000000u, "NV2A aperture at 0xFD000000" },
+                    { 0xFE800000u, "MCPX aperture at 0xFE800000" },
+                    { 0xFF000000u, "flash aperture at 0xFF000000" },
+                };
+                for (size_t i = 0; i < sizeof held / sizeof held[0]; i++) {
+                    unsigned char got = 0;
+                    char what[96];
+                    snprintf(what, sizeof what, "whole window: %s mapped",
+                             held[i].what);
+                    check(read_byte_in_child(b + held[i].va, &got), what, NULL);
+                }
+                /* A gap between windows: guest 0x90000000. */
+                {
+                    unsigned char got = 0;
+                    void *gap = b + 0x90000000u;
+                    void *q;
+                    check(!read_byte_in_child(gap, &got),
+                          "whole window: a gap faults on access",
+                          "the gap is readable memory");
+                    q = mmap(gap, 4096, PROT_READ,
+                             MAP_PRIVATE | MAP_ANONYMOUS
+#ifdef MAP_FIXED_NOREPLACE
+                             | MAP_FIXED_NOREPLACE
+#endif
+                             , -1, 0);
+                    check(q != gap, "whole window: the host cannot map into a gap",
+                          "an mmap landed inside the guest window");
+                    if (q != MAP_FAILED && q != gap)
+                        munmap(q, 4096);
+                }
+                xbox_MemoryLayoutShutdown();
+            }
+        }
+    }
+
     printf("\n%d failure(s)\n", failures);
     free(xbe);
     return failures ? 1 : 0;

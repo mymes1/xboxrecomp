@@ -2212,6 +2212,61 @@ BOOL UnmapViewOfFile(LPCVOID baseAddr)
     return munmap((void *)baseAddr, len) == 0;
 }
 
+/* [android-port] Address-space spans; see win32_compat.h. MAP_FIXED is safe
+ * here and only here: the caller guarantees the range is inside a reservation
+ * it holds, so the only mapping replaced is its own PROT_NONE one. */
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
+
+void *w32_span_reserve(SIZE_T size)
+{
+    void *p = mmap(NULL, size, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    return p;
+}
+
+void *w32_span_map_view(HANDLE mapping, SIZE_T size, void *addr)
+{
+    w32_object *o = obj_from_handle(mapping);
+    void *p;
+
+    if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
+    if (!addr || size == 0 || size > o->map_size) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    p = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+             o->fd, 0);
+    if (p == MAP_FAILED) {
+        /* A failed MAP_FIXED leaves the old mapping -- our reservation --
+         * where it was. */
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    view_register(p, size);
+    return p;
+}
+
+void *w32_span_commit(void *addr, SIZE_T size)
+{
+    void *p;
+
+    if (!addr || size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    p = mmap(addr, size, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (p == MAP_FAILED) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    view_register(p, size);
+    return p;
+}
+
 /* ===================================================================== */
 /* VirtualQuery                                                           */
 /* ===================================================================== */

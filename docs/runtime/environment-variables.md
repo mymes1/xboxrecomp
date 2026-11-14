@@ -58,6 +58,7 @@ Opt-ins that change how the kernel layer behaves. Each fixes a class of titles; 
 | `RECOMP_EXT_VMA` | off | Extended virtual-memory areas above the mirrors. | `guest_vmem.c`, `xbox_memory_layout.c` |
 | `RECOMP_CONTIG_AVOID_IMAGE=1` | off | Keeps contiguous allocations out of the image range. | `xbox_memory_layout.c` |
 | `RECOMP_WIN_PLACEHOLDER` | off | Reserves the guest window with placeholders on Windows hosts where fixed bases are taken. | `xbox_memory_layout.c` |
+| `RECOMP_WHOLE_WINDOW=0\|1` | on for Android, off elsewhere | POSIX: holds the whole 4 GB guest window as one `PROT_NONE` reservation from the start and maps RAM, the mirrors, the contiguous window and the device apertures over it in place (`MAP_FIXED` over our own reservation). Without it only RAM and the mirrors are held, and the windows above them land on whatever the host has there -- in an Android app process that is the ART heap and thread stacks. | `xbox_memory_layout.c`, `win32_compat.c` |
 | `RECOMP_TITLE_KEVENTS=1` | off | Host events for events a title builds inline instead of through `KeInitializeEvent`. | `kernel_bridge.c` |
 | `RECOMP_GUEST_LOCK=1` | off | Only one guest thread runs guest code at a time. | `kernel_guest_cpu.c` |
 | `RECOMP_GUEST_QUANTUM=ms` | 4 | With the lock: milliseconds before the lock is handed over (0 = at every call). | `kernel_guest_cpu.c` |

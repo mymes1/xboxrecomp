@@ -239,7 +239,8 @@ def stage_project(ctx):
     except project.ProjectError as e:
         raise StageError(str(e))
     return {"package": cfg["package"], "total_ram_mb": cfg["total_ram_mb"],
-            "env": cfg["env"], "app": "not generated yet (phase 7)"}
+            "env": cfg["env"], "native": "project/native",
+            "app": "project/app"}
 
 
 def _native_run(ctx):

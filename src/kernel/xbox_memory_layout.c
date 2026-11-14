@@ -87,6 +87,10 @@ static size_t g_span_size = 0;
  * every fixed-address window is carved out of it (layout_map_view,
  * layout_commit_at). See the span reservation in xbox_MemoryLayoutInit. */
 static int g_span_whole_window = 0;
+/* [android-port] POSIX: the span came from w32_span_reserve -- PROT_NONE,
+ * no commit charge -- because RECOMP_WHOLE_WINDOW asked for it (the default
+ * on Android). See whole_window_wanted. */
+static int g_span_prot_none = 0;
 
 /* POSIX: hand back the part of our span reservation a fixed-address window is
  * about to take. Only when the span holds the whole window; the stock span
@@ -94,6 +98,53 @@ static int g_span_whole_window = 0;
  * atomic: the slice is unmapped, then mapped again with MAP_FIXED_NOREPLACE,
  * and another thread's mmap could land in between. The window's map then fails
  * and says so, as it did before the span held it. */
+/* [android-port] POSIX: is [addr, addr+size) inside a span that holds the
+ * whole guest window? layout_map_view and layout_commit_at then replace that
+ * slice of the reservation in one MAP_FIXED step (w32_span_map_view,
+ * w32_span_commit) instead of releasing it and mapping into the hole -- the
+ * race the comment below describes. */
+static int span_holds(void *addr, size_t size)
+{
+#if !defined(_WIN32)
+    uintptr_t a = (uintptr_t)addr, lo = (uintptr_t)g_span_base;
+    return g_span_whole_window && g_span_base && a >= lo
+        && a + size <= lo + g_span_size;
+#else
+    (void)addr; (void)size;
+    return 0;
+#endif
+}
+
+/* [android-port] RECOMP_WHOLE_WINDOW: hold the whole 4 GB guest window from
+ * the start (POSIX), as RECOMP_EXT_VMA does, but as a PROT_NONE reservation
+ * and without handing any of it to guest_vmem. "1" turns it on, "0" off; the
+ * default is on for Android and off elsewhere, where the stock span is
+ * unchanged.
+ *
+ * Why Android needs it: the stock span covers RAM and its mirrors, and every
+ * window above them -- contiguous memory at 0x80000000, the tiled aperture,
+ * the NV2A/MCPX/flash apertures -- is placed afterwards at base + VA, on
+ * whatever is there. A desktop process is small and the range is free. An
+ * Android app process is not: the ART heap, the loaded libraries and a few
+ * dozen thread stacks are mapped by the time SDL_main runs, and Linux maps
+ * top-down from just below them. On the emulator every one of those windows
+ * failed (error 8), and the test title's first contiguous allocation wrote
+ * through guest 0x80001000 into someone else's memory until it reached a
+ * guard page a megabyte later (SEGV_ACCERR). Held from the start, a window
+ * that fails to map leaves the PROT_NONE reservation behind, so a stray
+ * access faults inside the guest window instead of corrupting the process. */
+static int whole_window_wanted(void)
+{
+    const char *e = getenv("RECOMP_WHOLE_WINDOW");
+    if (e && e[0])
+        return e[0] != '0';
+#if defined(__ANDROID__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 static void span_release_for(void *addr, size_t size)
 {
 #if !defined(_WIN32)
@@ -285,6 +336,9 @@ static void *layout_map_view(HANDLE mapping, size_t size, void *addr)
                                 MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
                                 NULL, 0);
     }
+#else
+    if (span_holds(addr, size))                 /* [android-port] */
+        return w32_span_map_view(mapping, size, addr);
 #endif
     span_release_for(addr, size);
     return MapViewOfFileEx(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size, addr);
@@ -305,6 +359,9 @@ static void *layout_commit_at(void *addr, size_t size)
             return NULL;
         return VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE);
     }
+#else
+    if (span_holds(addr, size))                 /* [android-port] */
+        return w32_span_commit(addr, size);
 #endif
     span_release_for(addr, size);
     return VirtualAlloc(addr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -2637,20 +2694,62 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             g_span_size = (size_t)1 << 32;
             g_span_whole_window = 1;
         }
-        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
-        if (g_span_base) {
-            VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
-            g_memory_base = MapViewOfFileEx(g_mapping_handle,
-                                            FILE_MAP_ALL_ACCESS, 0, 0,
-                                            g_memory_size, g_span_base);
-            if (!g_memory_base) {
-                VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
-                g_span_base = NULL;
-                g_span_size = 0;
+        /* [android-port] RECOMP_WHOLE_WINDOW (default on Android): the whole
+         * window as one PROT_NONE reservation, and the base view mapped over
+         * its head in one step. See whole_window_wanted. A window larger than
+         * 4 GB (base + mirrors past it) keeps the stock path. */
+        if (whole_window_wanted()
+                && (uint64_t)g_memory_size * (1u + XBOX_NUM_MIRRORS)
+                       <= ((uint64_t)1 << 32)) {
+            g_span_size = (size_t)1 << 32;
+            g_span_base = w32_span_reserve(g_span_size);
+            if (g_span_base) {
+                g_span_whole_window = 1;
+                g_span_prot_none = 1;
+                g_memory_base = w32_span_map_view(g_mapping_handle,
+                                                  g_memory_size, g_span_base);
+                if (g_memory_base) {
+                    fprintf(stderr, "xbox_MemoryLayoutInit: guest window held"
+                            " whole: %zu MB at %p (RECOMP_WHOLE_WINDOW)\n",
+                            g_span_size >> 20, g_span_base);
+                } else {
+                    fprintf(stderr, "xbox_MemoryLayoutInit: base view over the"
+                            " whole-window span failed (error %lu); stock"
+                            " layout\n", (unsigned long)GetLastError());
+                    VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+                    g_span_base = NULL;
+                    g_span_whole_window = 0;
+                    g_span_prot_none = 0;
+                    g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+                    if (g_span_size > XBOX_CONTIG_BASE)
+                        g_span_size = XBOX_CONTIG_BASE;
+                }
+            } else {
+                fprintf(stderr, "xbox_MemoryLayoutInit: could not reserve the"
+                        " 4 GB guest window (error %lu); stock layout\n",
+                        (unsigned long)GetLastError());
+                g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+                if (g_span_size > XBOX_CONTIG_BASE)
+                    g_span_size = XBOX_CONTIG_BASE;
+            }
+        }
+        if (!g_memory_base) {
+            g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE,
+                                       PAGE_NOACCESS);
+            if (g_span_base) {
+                VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
+                g_memory_base = MapViewOfFileEx(g_mapping_handle,
+                                                FILE_MAP_ALL_ACCESS, 0, 0,
+                                                g_memory_size, g_span_base);
+                if (!g_memory_base) {
+                    VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+                    g_span_base = NULL;
+                    g_span_size = 0;
+                    g_span_whole_window = 0;
+                }
+            } else {
                 g_span_whole_window = 0;
             }
-        } else {
-            g_span_whole_window = 0;
         }
 #endif
 
@@ -3725,6 +3824,7 @@ void xbox_MemoryLayoutShutdown(void)
         g_span_base = NULL;
         g_span_size = 0;
         g_span_whole_window = 0;
+        g_span_prot_none = 0;
     }
 #if defined(_WIN32)
     /* The rest of the Windows guest window: the leftover placeholders and

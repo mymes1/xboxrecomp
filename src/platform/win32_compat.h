@@ -536,6 +536,24 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access,
 BOOL   UnmapViewOfFile(LPCVOID baseAddr);
 #define CreateFileMapping CreateFileMappingA
 
+/* [android-port] Not Win32: address-space spans for xbox_memory_layout.c.
+ *
+ * w32_span_reserve holds `size` bytes of address space at an address the
+ * kernel picks: PROT_NONE and MAP_NORESERVE, so it costs no commit charge and
+ * any access faults. It is not entered in the view registry; the caller owns
+ * it and releases it with VirtualFree(base, size, MEM_RELEASE).
+ *
+ * w32_span_map_view and w32_span_commit replace [addr, addr+size) -- which
+ * must lie inside a span the caller holds -- with a shared view of `mapping`
+ * or with zeroed read-write memory, in one MAP_FIXED step. Releasing the slice
+ * first and then mapping into the hole leaves a window in which another
+ * thread's mmap can take the hole; in an Android process, with dozens of
+ * threads mapping memory, the hole is exactly where the kernel looks first.
+ * Both register the result like MapViewOfFileEx / VirtualAlloc do. */
+void *w32_span_reserve(SIZE_T size);
+void *w32_span_map_view(HANDLE mapping, SIZE_T size, void *addr);
+void *w32_span_commit(void *addr, SIZE_T size);
+
 /* ---- Aligned allocation ---------------------------------------------- */
 void *_aligned_malloc(SIZE_T size, SIZE_T alignment);
 void  _aligned_free(void *ptr);

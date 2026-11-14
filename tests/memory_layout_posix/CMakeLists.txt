@@ -15,3 +15,10 @@ enable_testing()
 add_test(NAME memory_layout_posix_test
          COMMAND memory_layout_posix_test
                  ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
+# [android-port] The same assertions with the whole guest window held from the
+# start (the Android default), plus the checks only that mode makes (test 7).
+add_test(NAME memory_layout_posix_whole_window
+         COMMAND memory_layout_posix_test
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
+set_tests_properties(memory_layout_posix_whole_window PROPERTIES
+                     ENVIRONMENT "RECOMP_WHOLE_WINDOW=1")

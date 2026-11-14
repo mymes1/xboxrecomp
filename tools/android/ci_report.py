@@ -82,6 +82,15 @@ def summarize(work, name, extra=None):
         if rt.get("crash_buffer"):
             out.append("## crash buffer")
             out.append("```\n%s\n```" % "\n".join(rt["crash_buffer"][:80]))
+        # Layout and kernel warnings are printed long before the tail; a
+        # window that failed to map is the cause of a crash many lines later.
+        key = [l for l in _tail(os.path.join(rep, "logs", "device_runtime.log"), 100000)
+               if re.search(r"WARNING|ERROR|FAILED|\[CRASH\]|XBRTEST|guest window|"
+                            r"Contiguous window|aperture:|RAM mirror", l)
+               and "Unresolved kernel ordinal" not in l]
+        if key:
+            out.append("## device runtime key lines")
+            out.append("```\n%s\n```" % "\n".join(key[:80]))
         out.append("## device runtime log tail")
         out.append("```\n%s\n```" % "\n".join(_tail(os.path.join(rep, "logs", "device_runtime.log"), 120)))
     compat = os.path.join(rep, "compatibility.md")
