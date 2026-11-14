@@ -12,10 +12,11 @@ def cfg = new groovy.json.JsonSlurper().parse(rootProject.file('xbr_game.json'))
 
 // Release signing: a keystore named by the environment (CI secrets), else the
 // key the pipeline generated for this project (see apk.py).
-def ks = System.getenv('XBR_KEYSTORE') ?: rootProject.file('signing/xbr-release.jks').path
-def ksPass = System.getenv('XBR_KEYSTORE_PASSWORD') ?: (rootProject.file('signing/password.txt').exists() ? rootProject.file('signing/password.txt').text.trim() : '')
-def keyAlias = System.getenv('XBR_KEY_ALIAS') ?: 'xbr'
-def keyPass = System.getenv('XBR_KEY_PASSWORD') ?: ksPass
+def xbrStore = System.getenv('XBR_KEYSTORE') ?: rootProject.file('signing/xbr-release.jks').path
+def xbrPwFile = rootProject.file('signing/password.txt')
+def xbrStorePass = System.getenv('XBR_KEYSTORE_PASSWORD') ?: (xbrPwFile.exists() ? xbrPwFile.text.trim() : '')
+def xbrKeyAlias = System.getenv('XBR_KEY_ALIAS') ?: 'xbr'
+def xbrKeyPass = System.getenv('XBR_KEY_PASSWORD') ?: xbrStorePass
 
 android {
     namespace 'org.xboxrecomp.app'
@@ -38,10 +39,10 @@ android {
 
     signingConfigs {
         release {
-            storeFile file(ks)
-            storePassword ksPass
-            keyAlias keyAlias
-            keyPassword keyPass
+            storeFile = file(xbrStore)
+            storePassword = xbrStorePass
+            keyAlias = xbrKeyAlias
+            keyPassword = xbrKeyPass
         }
     }
 

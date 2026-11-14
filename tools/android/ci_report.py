@@ -13,6 +13,7 @@ any failed stage.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -71,8 +72,21 @@ def summarize(work, name, extra=None):
         with open(compat, encoding="utf-8") as f:
             out.append(f.read()[:12000])
     for stage in failed:
+        logp = os.path.join(rep, "logs", stage + ".log")
+        lines = _tail(logp, 100000)
+        # The cause is usually far above the tail (Gradle prints the stack
+        # after "What went wrong"); keep those lines and what follows them.
+        key = []
+        for i, line in enumerate(lines):
+            if re.search(r"What went wrong|error:|Error:|FAILED|Caused by|Exception:|undefined reference|fatal", line):
+                key.extend(lines[i:i + 6])
+                if len(key) > 120:
+                    break
+        if key:
+            out.append("## key lines: %s" % stage)
+            out.append("```\n%s\n```" % "\n".join(key[:120]))
         out.append("## log tail: %s" % stage)
-        out.append("```\n%s\n```" % "\n".join(_tail(os.path.join(rep, "logs", stage + ".log"), 150)))
+        out.append("```\n%s\n```" % "\n".join(lines[-80:]))
     if hr and (hr.get("crash") or not hr.get("entry_reached")):
         out.append("## host run log tail")
         out.append("```\n%s\n```" % "\n".join(_tail(os.path.join(rep, "logs", "host_run.log"), 120)))
