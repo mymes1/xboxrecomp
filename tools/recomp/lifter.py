@@ -1982,6 +1982,13 @@ class Lifter:
         # unlocked xadd on memory is single-CPU-safe on the console and
         # costs nothing extra to make safe here.
         atomic_m = m[5:] if m.startswith("lock ") else m
+        # [android-port] The rest of the family (lock add/inc/dec/sub/and/or/
+        # xor/not/neg/adc/sbb/bts/btr/btc/xchg, 8- and 16-bit xadd/cmpxchg,
+        # cmpxchg8b). 32-bit xadd/cmpxchg keep the lowering below.
+        if m.startswith("lock ") or atomic_m in ("xadd", "cmpxchg", "cmpxchg8b"):
+            locked = self._lift_locked(insn, ops, m, atomic_m)
+            if locked is not None:
+                return locked
         if atomic_m in ("xadd", "cmpxchg") and len(ops) >= 2:
             width = _operand_width(ops[0]) or 4
             if width == 4 and ops[0].type == "mem":
@@ -2022,6 +2029,170 @@ class Lifter:
         #
         # Recorded, not merely commented -- see self.unimplemented.
         return self._unimplemented(insn, m)
+
+    # ── lock-prefixed read-modify-write ──
+
+    _ATOMIC_CTYPE = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t"}
+    _ATOMIC_ACC = {1: "al", 2: "ax", 4: "eax"}
+
+    def _lift_locked(self, insn, ops, m, op):
+        """[android-port] One atomic operation for a locked read-modify-write.
+
+        Each form calls a RECOMP_ATOMIC_* helper (recomp_types.h), which
+        returns the old value, and derives the flags from that old value
+        exactly as the unlocked lift derives them from its operands: add/sub
+        publish the source into _fb before and the result into _fa after,
+        inc/dec put OF in _fb, the logical ops clear CF, bts/btr/btc put the
+        old bit in CF. A read of the destination after the atomic would see
+        whatever another thread wrote since, so nothing here re-reads it.
+
+        Returns None for shapes it does not lower (the caller then reports the
+        instruction through RECOMP_UNIMPL, as before).
+        """
+        if op == "xchg":
+            if len(ops) < 2:
+                return None
+            mem, reg = (ops[0], ops[1]) if ops[0].type == "mem" else (ops[1], ops[0])
+            width = _operand_width(mem) or 4
+            if mem.type != "mem" or reg.type != "reg" or width not in self._ATOMIC_CTYPE:
+                return None
+            ctype = self._ATOMIC_CTYPE[width]
+            return [f"{{ {ctype} _old = RECOMP_ATOMIC_XCHG{width * 8}("
+                    f"XBOX_PTR({_fmt_mem(mem)}), ({ctype})({_fmt_operand_read(reg)}));",
+                    "  " + _fmt_operand_write(reg, "_old") + f" }}  /* {m} */"]
+
+        if op == "cmpxchg8b":
+            if not ops or ops[0].type != "mem":
+                return None
+            # ZF only (the other flags are unchanged): published through the
+            # cmpxchg snapshot, so a jz/jnz after it reads (_fa == _fb).
+            return ["{ uint64_t _cmp = ((uint64_t)edx << 32) | eax;",
+                    "  uint64_t _new = ((uint64_t)ecx << 32) | ebx;",
+                    "  uint64_t _old = RECOMP_ATOMIC_CAS64("
+                    f"XBOX_PTR({_fmt_mem(ops[0])}), _cmp, _new);",
+                    "  _fa = (_old == _cmp) ? 0u : 1u; _fb = 0;"
+                    " _fas = (int32_t)_fa; _fbs = 0;",
+                    "  if (_old != _cmp) { eax = (uint32_t)_old;"
+                    " edx = (uint32_t)(_old >> 32); } }"
+                    f"  /* {m} */"]
+
+        if not ops or ops[0].type != "mem":
+            return None
+        width = _operand_width(ops[0]) or 4
+        if width not in self._ATOMIC_CTYPE:
+            return None
+        bits = width * 8
+        ctype = self._ATOMIC_CTYPE[width]
+        mask, sx = self._SNAP_MASK[width], self._SNAP_SX[width]
+        addr = _fmt_mem(ops[0])
+        ptr = f"XBOX_PTR({addr})"
+        result = (f"  _fa = (uint32_t)_new & {mask}; _fas = (int32_t){sx}(_fa);"
+                  f" /* {m} result */")
+
+        if op in ("xadd", "cmpxchg"):
+            if width == 4 or len(ops) < 2 or ops[1].type != "reg":
+                return None         # 32-bit: the original lowering
+            src = f"({ctype})({_fmt_operand_read(ops[1])})"
+            if op == "xadd":
+                return [f"{{ {ctype} _add = {src};",
+                        f"  {ctype} _old = RECOMP_ATOMIC_ADD{bits}({ptr}, _add);",
+                        f"  {ctype} _new = ({ctype})(_old + _add);",
+                        result,
+                        "  " + _fmt_operand_write(ops[1], "_old") + f" }}  /* {m} */"]
+            acc = self._ATOMIC_ACC[width]
+            return [f"{{ {ctype} _cmp = ({ctype}){_fmt_reg(acc)};",
+                    f"  {ctype} _old = RECOMP_ATOMIC_CAS{bits}({ptr}, _cmp, {src});",
+                    "  _fa = _old; _fb = _cmp;",
+                    f"  _fas = (int32_t){sx}(_fa); _fbs = (int32_t){sx}(_fb);",
+                    "  if (_old != _cmp) " + _fmt_set_reg(acc, "_old") + f" }}  /* {m} */"]
+
+        if op in ("add", "sub", "and", "or", "xor"):
+            if len(ops) < 2:
+                return None
+            out = [f"{{ {ctype} _v = ({ctype}){_narrow_source(ops)};"]
+            if op in ("add", "sub"):
+                out.append(f"  _fb = (uint32_t)_v & {mask}; _fbs = (int32_t){sx}(_fb);"
+                           f" /* {op} source */")
+            fn = {"add": "ADD", "sub": "ADD", "and": "AND", "or": "OR", "xor": "XOR"}[op]
+            arg = f"({ctype})(0u - _v)" if op == "sub" else "_v"
+            out.append(f"  {ctype} _old = RECOMP_ATOMIC_{fn}{bits}({ptr}, {arg});")
+            c_op = {"add": "+", "sub": "-", "and": "&", "or": "|", "xor": "^"}[op]
+            out.append(f"  {ctype} _new = ({ctype})(_old {c_op} _v);")
+            if self.needs_cf:
+                if op == "add":
+                    out.append(f"  _cf = (int)((((uint64_t)_old + (uint64_t)_v) >> {bits}) & 1);")
+                elif op == "sub":
+                    out.append("  _cf = (int)(_old < _v);")
+                else:
+                    out.append("  _cf = 0; /* logical op clears CF */")
+            out.append(result + " }")
+            return out
+
+        if op in ("inc", "dec"):
+            delta = "1" if op == "inc" else f"({ctype})-1"
+            ovf = (1 << (bits - 1)) - (op == "dec")
+            return [f"{{ {ctype} _old = RECOMP_ATOMIC_ADD{bits}({ptr}, {delta});",
+                    f"  {ctype} _new = ({ctype})(_old {'+' if op == 'inc' else '-'} 1);",
+                    f"  _fa = (uint32_t)_new & {mask}; _fas = (int32_t){sx}(_fa);"
+                    f" _fb = (_fa == 0x{ovf:X}u); /* {m} result/SF/OF; CF unchanged */ }}"]
+
+        if op == "not":
+            return [f"(void)RECOMP_ATOMIC_XOR{bits}({ptr}, ({ctype}){mask}); /* {m} */"]
+
+        if op in ("neg", "adc", "sbb"):
+            # No fetch-and-op exists for these: a compare-and-swap loop.
+            mem = {1: "MEM8", 2: "MEM16", 4: "MEM32"}[width]
+            if op == "neg":
+                calc = f"_new = ({ctype})(0u - _old);"
+                pre = ""
+            else:
+                if len(ops) < 2:
+                    return None
+                pre = f"{ctype} _v = ({ctype}){_narrow_source(ops)}; uint32_t _ci = (uint32_t)(_cf & 1); "
+                sign = "+" if op == "adc" else "-"
+                calc = f"_new = ({ctype})(_old {sign} _v {sign} _ci);"
+            out = [f"{{ {pre}{ctype} _old, _new;",
+                   f"  do {{ _old = {mem}({addr}); {calc} }}"
+                   f" while (RECOMP_ATOMIC_CAS{bits}({ptr}, _old, _new) != _old);"]
+            if op == "neg":
+                if self.needs_cf:
+                    out.append("  _cf = (int)(_old != 0);")
+            elif op == "adc":
+                out.append(f"  _cf = (int)((((uint64_t)_old + _v + _ci) >> {bits}) & 1);")
+                out.append(f"  _fb = (((uint32_t)_old ^ _new) & ((uint32_t)_v ^ _new)) >> {bits - 1} & 1u;")
+            else:
+                out.append(f"  _cf = (int)((((uint64_t)_old - _v - _ci) >> {bits}) & 1);")
+                out.append(f"  _fb = (((uint32_t)_old ^ _v) & ((uint32_t)_old ^ _new)) >> {bits - 1} & 1u;")
+            out.append(result + " }")
+            return out
+
+        if op in ("bts", "btr", "btc"):
+            if len(ops) < 2:
+                return None
+            fn = {"bts": "OR", "btr": "AND", "btc": "XOR"}[op]
+            bit = ops[1]
+            if bit.type == "imm":
+                index = bit.imm & (bits - 1)
+                bm = f"({ctype})0x{1 << index:X}u"
+                target = ptr
+                pre = ""
+            elif width == 4:
+                # Bit-string addressing, as the unlocked lift does it: the
+                # register offset selects the dword, then the bit within it.
+                off = _fmt_operand_read(bit)
+                pre = (f"uint32_t _bo = {off}; uint32_t _ba = ({addr})"
+                       " + (uint32_t)(((int32_t)_bo >> 5) * 4); ")
+                bm = "(1u << (_bo & 31))"
+                target = "XBOX_PTR(_ba)"
+            else:
+                return None
+            arg = f"({ctype})~{bm}" if op == "btr" else bm
+            out = [f"{{ {pre}{ctype} _old = RECOMP_ATOMIC_{fn}{bits}({target}, {arg});"]
+            out.append((f"  _cf = (int)((_old & {bm}) != 0); /* {m}: CF = old bit */"
+                        if self.needs_cf else f"  (void)_old; /* {m} */") + " }")
+            return out
+
+        return None
 
     # ── MOV family ──
 
@@ -2095,6 +2266,13 @@ class Lifter:
     def _lift_xchg(self, insn, ops):
         if len(ops) < 2:
             return [f"/* xchg: bad operands */"]
+        # [android-port] xchg with a memory operand asserts LOCK by itself:
+        # it is the spin lock's acquire, so it must be atomic once guest
+        # threads run on real host threads.
+        if (ops[0].type == "mem") != (ops[1].type == "mem"):
+            locked = self._lift_locked(insn, ops, insn.mnemonic, "xchg")
+            if locked is not None:
+                return locked
         a = _fmt_operand_read(ops[0])
         b = _fmt_operand_read(ops[1])
         return [
@@ -4456,11 +4634,23 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # Flags are undefined after these - clear tracking
             last_flag_setter = None
             last_flag_ops = []
-        elif curr.mnemonic in ("lock xadd", "lock cmpxchg"):
+        elif curr.mnemonic.startswith("lock ") or curr.mnemonic == "cmpxchg8b":
             # Capstone keeps the lock prefix in the mnemonic; the flags are
             # those of the bare instruction, which the lowering snapshots.
-            last_flag_setter = curr.mnemonic[5:]
-            last_flag_ops = list(curr.operands)
+            # [android-port] Generalised from xadd/cmpxchg to the whole
+            # family _lift_locked lowers; cmpxchg8b publishes its ZF through
+            # the cmpxchg snapshot.
+            bare = curr.mnemonic.removeprefix("lock ")
+            if bare == "cmpxchg8b":
+                last_flag_setter, last_flag_ops = "cmpxchg", list(curr.operands)
+            elif bare in FLAG_SETTERS or bare in _EFLAGS_SETTERS:
+                last_flag_setter = bare
+                last_flag_ops = list(curr.operands)
+            elif bare in _EFLAGS_PRESERVE:
+                pass        # lock not, lock xchg
+            else:
+                last_flag_setter = None
+                last_flag_ops = []
         elif curr.mnemonic in _EFLAGS_SETTERS:
             # Additional flag-setting instructions
             last_flag_setter, last_flag_ops = normalise_zero_test(

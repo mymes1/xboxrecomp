@@ -439,7 +439,7 @@ _CARRY_CONDITIONS = {
 
 def _flags_read(insn):
     """The parts of _ALL_FLAGS an instruction reads."""
-    m = insn.mnemonic
+    m = insn.mnemonic.removeprefix("lock ")  # [android-port] lock adc/sbb
     if m in ("adc", "sbb", "rcl", "rcr", "cmc", "salc"):
         return _CARRY
     if m in ("pushf", "pushfd", "lahf"):
@@ -1879,7 +1879,9 @@ class FunctionTranslator:
 
         last_setter = None
         for insn in instructions:
-            m = insn.mnemonic
+            # [android-port] A locked form sets and reads flags exactly as the
+            # bare instruction does (lifter.Lifter._lift_locked).
+            m = insn.mnemonic.removeprefix("lock ")
             if m in ("adc", "sbb", "stc", "clc", "cmc", "rcl", "rcr"):
                 return True
             cc = None
@@ -2048,7 +2050,9 @@ class FunctionTranslator:
         from .lifter import FLAG_SETTERS, _EFLAGS_SETTERS, _FLAGS_UNDEFINED
 
         def sets(insn):
-            m = insn.mnemonic
+            m = insn.mnemonic.removeprefix("lock ")  # [android-port]
+            if m == "cmpxchg8b":
+                return frozenset()  # ZF only: the rest pass through
             if m in ("inc", "dec"):
                 return _OTHER_FLAGS
             if m in ("stc", "clc", "cmc"):
@@ -3160,9 +3164,12 @@ class FunctionTranslator:
         # sub_000EEA10 in Wreckless is exactly `bsf eax, ecx; ret`.
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
-        if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg", "inc", "dec", "imul", "mul", "sahf", "fcomi",
-                                 "fcomip", "fcompi", "fucomi", "fucomip", "fucompi")
+        # [android-port] Every locked form publishes through the same
+        # snapshot as its bare instruction, and cmpxchg8b through cmpxchg's.
+        if any(insn.mnemonic.removeprefix("lock ") in (
+                   "cmp", "test", "bsf", "bsr", "cmpxchg", "cmpxchg8b",
+                   "inc", "dec", "imul", "mul", "sahf", "fcomi",
+                   "fcomip", "fcompi", "fucomi", "fucomip", "fucompi")
                or insn.mnemonic.removeprefix("lock ") in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")

@@ -26,7 +26,7 @@ never reported as "works".
 |---|---|---|
 | 1 | Inspection, dependency automation | **Done**: [INSPECTION.md](INSPECTION.md); pinned and verified inputs ([DEPENDENCIES.md](DEPENDENCIES.md)) |
 | 2 | ISO download/verify/extract, XBE analysis, game project | intake/analyze/recompile stages work on the self-built test title (`python3 -m pytest tools/android`); the game-project stage arrives with Phase 4 |
-| 3 | ARM64 code generation | not started |
+| 3 | ARM64 code generation | in progress: the whole `lock` family lowers atomically (was RECOMP_UNIMPL); generated C compiles for aarch64 (zig, locally); NDK build runs in CI |
 | 4 | Android kernel/runtime | not started |
 | 5 | Vulkan back end | not started |
 | 6 | Audio, input, assets | not started |

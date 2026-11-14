@@ -222,13 +222,109 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
  * now run on real host threads, so a read-modify-write that races is exactly
  * the bug these instructions exist to prevent.
  */
+/* [android-port] The rest of the lock-prefixed family -- add/sub/inc/dec/
+ * and/or/xor/not/neg/adc/sbb/bts/btr/btc on memory, xchg with memory (locked
+ * whether or not it says so), 8/16-bit xadd/cmpxchg and cmpxchg8b -- lowers
+ * through the helpers below (tools/recomp/lifter.py, Lifter._lift_locked).
+ * Every helper returns the value the location held before the operation, so
+ * the lift computes the flags from that and not from a re-read another thread
+ * may already have changed.
+ *
+ * ARM64 hosts fault on a misaligned atomic (x86 performs it as a split lock),
+ * so there a misaligned location takes a plain read-modify-write instead.
+ * That is still exact under RECOMP_GUEST_LOCK=1, where one guest thread runs
+ * at a time, as on the console's single CPU; without the guest lock it is
+ * atomic only against itself. Compilers align the integers they lock. */
 #if defined(_MSC_VER)
 #include <intrin.h>
 #define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)))
 #define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)_InterlockedCompareExchange((volatile long *)(p),                                            (long)(val), (long)(cmp)))
+#define RECOMP_ATOMIC_ADD8(p, v)   ((uint8_t)_InterlockedExchangeAdd8((volatile char *)(p), (char)(v)))
+#define RECOMP_ATOMIC_ADD16(p, v)  ((uint16_t)_InterlockedExchangeAdd16((volatile short *)(p), (short)(v)))
+#define RECOMP_ATOMIC_AND8(p, v)   ((uint8_t)_InterlockedAnd8((volatile char *)(p), (char)(v)))
+#define RECOMP_ATOMIC_AND16(p, v)  ((uint16_t)_InterlockedAnd16((volatile short *)(p), (short)(v)))
+#define RECOMP_ATOMIC_AND32(p, v)  ((uint32_t)_InterlockedAnd((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_OR8(p, v)    ((uint8_t)_InterlockedOr8((volatile char *)(p), (char)(v)))
+#define RECOMP_ATOMIC_OR16(p, v)   ((uint16_t)_InterlockedOr16((volatile short *)(p), (short)(v)))
+#define RECOMP_ATOMIC_OR32(p, v)   ((uint32_t)_InterlockedOr((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_XOR8(p, v)   ((uint8_t)_InterlockedXor8((volatile char *)(p), (char)(v)))
+#define RECOMP_ATOMIC_XOR16(p, v)  ((uint16_t)_InterlockedXor16((volatile short *)(p), (short)(v)))
+#define RECOMP_ATOMIC_XOR32(p, v)  ((uint32_t)_InterlockedXor((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_XCHG8(p, v)  ((uint8_t)_InterlockedExchange8((volatile char *)(p), (char)(v)))
+#define RECOMP_ATOMIC_XCHG16(p, v) ((uint16_t)_InterlockedExchange16((volatile short *)(p), (short)(v)))
+#define RECOMP_ATOMIC_XCHG32(p, v) ((uint32_t)_InterlockedExchange((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_CAS8(p, cmp, val)  ((uint8_t)_InterlockedCompareExchange8((volatile char *)(p), (char)(val), (char)(cmp)))
+#define RECOMP_ATOMIC_CAS16(p, cmp, val) ((uint16_t)_InterlockedCompareExchange16((volatile short *)(p), (short)(val), (short)(cmp)))
+#define RECOMP_ATOMIC_CAS64(p, cmp, val) ((uint64_t)_InterlockedCompareExchange64((volatile __int64 *)(p), (__int64)(val), (__int64)(cmp)))
 #else
-#define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)__sync_fetch_and_add((volatile uint32_t *)(p), (uint32_t)(v)))
-#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p),                                            (uint32_t)(cmp), (uint32_t)(val)))
+#ifndef RECOMP_ATOMIC_ALIGNED_   /* a test may force the check on x86 */
+#if defined(__i386__) || defined(__x86_64__)
+#define RECOMP_ATOMIC_ALIGNED_(p, n) 1
+#else
+#define RECOMP_ATOMIC_ALIGNED_(p, n) ((((uintptr_t)(p)) & ((uintptr_t)(n) - 1u)) == 0)
+#endif
+#endif
+#define RECOMP_ATOMIC_FETCH_FN_(name, T, builtin, combine)                      \
+    static inline T recomp_atomic_##name(volatile void *p, T v) {              \
+        if (RECOMP_ATOMIC_ALIGNED_(p, sizeof(T)))                              \
+            return builtin((volatile T *)p, v, __ATOMIC_SEQ_CST);              \
+        T o, n; memcpy(&o, (const void *)(uintptr_t)p, sizeof o);              \
+        n = (T)(combine); memcpy((void *)(uintptr_t)p, &n, sizeof n);          \
+        return o;                                                              \
+    }
+#define RECOMP_ATOMIC_CAS_FN_(name, T)                                          \
+    static inline T recomp_atomic_##name(volatile void *p, T cmp, T val) {     \
+        T o;                                                                   \
+        if (RECOMP_ATOMIC_ALIGNED_(p, sizeof(T))) {                            \
+            o = cmp;                                                           \
+            __atomic_compare_exchange_n((volatile T *)p, &o, val, 0,           \
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);   \
+            return o;                                                          \
+        }                                                                      \
+        memcpy(&o, (const void *)(uintptr_t)p, sizeof o);                      \
+        if (o == cmp) memcpy((void *)(uintptr_t)p, &val, sizeof val);          \
+        return o;                                                              \
+    }
+RECOMP_ATOMIC_FETCH_FN_(add8,   uint8_t,  __atomic_fetch_add, o + v)
+RECOMP_ATOMIC_FETCH_FN_(add16,  uint16_t, __atomic_fetch_add, o + v)
+RECOMP_ATOMIC_FETCH_FN_(add32,  uint32_t, __atomic_fetch_add, o + v)
+RECOMP_ATOMIC_FETCH_FN_(and8,   uint8_t,  __atomic_fetch_and, o & v)
+RECOMP_ATOMIC_FETCH_FN_(and16,  uint16_t, __atomic_fetch_and, o & v)
+RECOMP_ATOMIC_FETCH_FN_(and32,  uint32_t, __atomic_fetch_and, o & v)
+RECOMP_ATOMIC_FETCH_FN_(or8,    uint8_t,  __atomic_fetch_or,  o | v)
+RECOMP_ATOMIC_FETCH_FN_(or16,   uint16_t, __atomic_fetch_or,  o | v)
+RECOMP_ATOMIC_FETCH_FN_(or32,   uint32_t, __atomic_fetch_or,  o | v)
+RECOMP_ATOMIC_FETCH_FN_(xor8,   uint8_t,  __atomic_fetch_xor, o ^ v)
+RECOMP_ATOMIC_FETCH_FN_(xor16,  uint16_t, __atomic_fetch_xor, o ^ v)
+RECOMP_ATOMIC_FETCH_FN_(xor32,  uint32_t, __atomic_fetch_xor, o ^ v)
+RECOMP_ATOMIC_FETCH_FN_(xchg8,  uint8_t,  __atomic_exchange_n, v)
+RECOMP_ATOMIC_FETCH_FN_(xchg16, uint16_t, __atomic_exchange_n, v)
+RECOMP_ATOMIC_FETCH_FN_(xchg32, uint32_t, __atomic_exchange_n, v)
+RECOMP_ATOMIC_CAS_FN_(cas8,  uint8_t)
+RECOMP_ATOMIC_CAS_FN_(cas16, uint16_t)
+RECOMP_ATOMIC_CAS_FN_(cas32, uint32_t)
+RECOMP_ATOMIC_CAS_FN_(cas64, uint64_t)
+#undef RECOMP_ATOMIC_FETCH_FN_
+#undef RECOMP_ATOMIC_CAS_FN_
+#define RECOMP_ATOMIC_ADD32(p, v)        recomp_atomic_add32((volatile void *)(p), (uint32_t)(v))
+#define RECOMP_ATOMIC_CAS32(p, cmp, val) recomp_atomic_cas32((volatile void *)(p), (uint32_t)(cmp), (uint32_t)(val))
+#define RECOMP_ATOMIC_ADD8(p, v)    recomp_atomic_add8((volatile void *)(p), (uint8_t)(v))
+#define RECOMP_ATOMIC_ADD16(p, v)   recomp_atomic_add16((volatile void *)(p), (uint16_t)(v))
+#define RECOMP_ATOMIC_AND8(p, v)    recomp_atomic_and8((volatile void *)(p), (uint8_t)(v))
+#define RECOMP_ATOMIC_AND16(p, v)   recomp_atomic_and16((volatile void *)(p), (uint16_t)(v))
+#define RECOMP_ATOMIC_AND32(p, v)   recomp_atomic_and32((volatile void *)(p), (uint32_t)(v))
+#define RECOMP_ATOMIC_OR8(p, v)     recomp_atomic_or8((volatile void *)(p), (uint8_t)(v))
+#define RECOMP_ATOMIC_OR16(p, v)    recomp_atomic_or16((volatile void *)(p), (uint16_t)(v))
+#define RECOMP_ATOMIC_OR32(p, v)    recomp_atomic_or32((volatile void *)(p), (uint32_t)(v))
+#define RECOMP_ATOMIC_XOR8(p, v)    recomp_atomic_xor8((volatile void *)(p), (uint8_t)(v))
+#define RECOMP_ATOMIC_XOR16(p, v)   recomp_atomic_xor16((volatile void *)(p), (uint16_t)(v))
+#define RECOMP_ATOMIC_XOR32(p, v)   recomp_atomic_xor32((volatile void *)(p), (uint32_t)(v))
+#define RECOMP_ATOMIC_XCHG8(p, v)   recomp_atomic_xchg8((volatile void *)(p), (uint8_t)(v))
+#define RECOMP_ATOMIC_XCHG16(p, v)  recomp_atomic_xchg16((volatile void *)(p), (uint16_t)(v))
+#define RECOMP_ATOMIC_XCHG32(p, v)  recomp_atomic_xchg32((volatile void *)(p), (uint32_t)(v))
+#define RECOMP_ATOMIC_CAS8(p, cmp, val)  recomp_atomic_cas8((volatile void *)(p), (uint8_t)(cmp), (uint8_t)(val))
+#define RECOMP_ATOMIC_CAS16(p, cmp, val) recomp_atomic_cas16((volatile void *)(p), (uint16_t)(cmp), (uint16_t)(val))
+#define RECOMP_ATOMIC_CAS64(p, cmp, val) recomp_atomic_cas64((volatile void *)(p), (uint64_t)(cmp), (uint64_t)(val))
 #endif
 
 #include <setjmp.h>
