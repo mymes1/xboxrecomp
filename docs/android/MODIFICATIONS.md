@@ -32,4 +32,11 @@ workflow runs the suite on Ubuntu with the same expectations upstream has.
 | `tools/android/deps.lock.json` | every pinned dependency: Android SDK packages, NDK r27d, JDK, Gradle + AGP, SDL2/Vulkan-Headers/extract-xiso commits, glslangValidator archive |
 | `tools/android/requirements-pipeline.txt`, `requirements-dev.txt` | hash-locked Python inputs |
 | `tools/android/fetch_deps.py`, `bootstrap.sh` | fetch-and-verify for all of the above; writes `build/android-deps/{deps-manifest.json,android-env.sh}` |
+| `tools/android/iso.py` | disc intake: acquire (path/URL, credentials moved to a header, never logged), SHA-256 verification, XDVDFS detection, traversal-safe extraction with a manifest, `default.xbe` lookup |
+| `tools/android/xiso_build.py` | XDVDFS writer (balanced directory trees, sector-safe entries) for fixtures and the test title |
+| `tools/android/xbe_info.py` | structured XBE analysis on top of `tools.xbe_parser` + `tools.kernel_audit.coverage`; title-image (XPR0: DXT1/3/5, swizzled ARGB) decoding to PNG |
+| `tools/android/compat.py` | compatibility report with evidence-gated levels |
+| `tools/android/pipeline.py` | the staged ISO -> APK driver |
+| `tools/android/testtitle/` | a self-built Xbox test title (C, built with the pinned zig), `pe2xbe.py`, disc packing; original code, no game content |
+| `tools/android/test_*.py` | tests for the above |
 | `docs/android/*.md` | this documentation |

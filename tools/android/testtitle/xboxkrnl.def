@@ -1,0 +1,20 @@
+; Import library definition for the Xbox kernel, by ordinal.
+; Ordinals: https://xboxdevwiki.net/Kernel (the runtime's kernel_bridge.c
+; routes all of them). Only what xbrtest.c calls is listed.
+LIBRARY xboxkrnl.exe
+EXPORTS
+    AvSetDisplayMode@24            @3   NONAME
+    DbgPrint                       @8   NONAME
+    HalReturnToFirmware@4          @49  NONAME
+    KeDelayExecutionThread@12      @99  NONAME
+    KeQueryPerformanceCounter@0    @126 NONAME
+    KeQueryPerformanceFrequency@0  @127 NONAME
+    KeQuerySystemTime@4            @128 NONAME
+    MmAllocateContiguousMemory@4   @165 NONAME
+    MmGetPhysicalAddress@4         @173 NONAME
+    NtClose@4                      @187 NONAME
+    NtCreateFile@36                @190 NONAME
+    NtReadFile@32                  @219 NONAME
+    NtWriteFile@32                 @236 NONAME
+    PsCreateSystemThreadEx@40      @255 NONAME
+    PsTerminateSystemThread@4      @258 NONAME

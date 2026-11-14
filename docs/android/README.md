@@ -25,7 +25,7 @@ never reported as "works".
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Inspection, dependency automation | **Done**: [INSPECTION.md](INSPECTION.md); pinned and verified inputs ([DEPENDENCIES.md](DEPENDENCIES.md)) |
-| 2 | ISO download/verify/extract, XBE analysis, game project | in progress |
+| 2 | ISO download/verify/extract, XBE analysis, game project | intake/analyze/recompile stages work on the self-built test title (`python3 -m pytest tools/android`); the game-project stage arrives with Phase 4 |
 | 3 | ARM64 code generation | not started |
 | 4 | Android kernel/runtime | not started |
 | 5 | Vulkan back end | not started |
