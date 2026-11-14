@@ -163,7 +163,9 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -m tools.android.ci_report --work build/games/xbrtest --name linux-arm64 --post --note "runner: $(uname -m), page size $(getconf PAGESIZE)"
+        run: |
+          python3 -m tools.android.ci_report --work build/games/xbrtest --name linux-arm64 --post \
+            --note "runner $(uname -m), page size $(getconf PAGESIZE)"
 
       - uses: actions/upload-artifact@v4
         if: always()
