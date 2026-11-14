@@ -4,11 +4,20 @@ Inputs are the artefacts the stages leave in the work directory; nothing here
 re-runs a tool. The report keeps the levels distinct and only claims the ones
 there is evidence for:
 
-    Compiled              the generated C and runtime linked into an arm64 library
-    Runtime initialized   boot log reached the recompiled entry point on ARM64
-    Game booted           the title's own code ran and frames were presented
+    Compiled              the generated C and runtime linked into an Android
+                          arm64-v8a library (reports/native_build.json)
+    Runtime initialized   on an Android device or emulator, the boot log
+                          reached the recompiled entry point
+                          (reports/runtime_test.json, platform android-*)
+    Game booted           ... and the title's own code kept running and drew:
+                          pushbuffer flips, or a scanout surface that changed
     Gameplay tested       a person played it (never set by automation)
     Full compatibility    never set by automation
+
+Two kinds of evidence are reported but never raise the level, because they
+say nothing about a device: the compile-only check (reports/native_check.json,
+nothing linked) and desktop host runs of the same project
+(reports/host_build.json, host_runtime.json).
 
 Every unimplemented instruction, unresolved call target and unrouted kernel
 import is listed with its address; nothing is summarised away.
@@ -36,6 +45,9 @@ def build(work):
     native = _load(os.path.join(rep, "native_build.json"))
     runtime = _load(os.path.join(rep, "runtime_test.json"))
     apk = _load(os.path.join(rep, "apk_verify.json"))
+    check = _load(os.path.join(rep, "native_check.json"))
+    host_build = _load(os.path.join(rep, "host_build.json"))
+    host_run = _load(os.path.join(rep, "host_runtime.json"))
     evidence = {}
     level = None
     if xbe and not xbe.get("problems"):
@@ -44,15 +56,17 @@ def build(work):
     if summary and summary.get("translated") and not summary.get("failed"):
         level = "Recompiled"
         evidence["Recompiled"] = "reports/recomp_summary.json"
-    if native and native.get("ok"):
+    if native and native.get("ok") and str(native.get("target", "")).startswith("android-"):
         level = "Compiled"
         evidence["Compiled"] = "reports/native_build.json"
-    if runtime and runtime.get("entry_reached"):
+    on_device = runtime and str(runtime.get("platform", "")).startswith("android-")
+    if level == "Compiled" and on_device and runtime.get("entry_reached"):
         level = "Runtime initialized"
         evidence["Runtime initialized"] = runtime.get("log", "reports/runtime_test.json")
-        if runtime.get("frames_presented", 0) > 0 and runtime.get("guest_progress"):
+        drew = runtime.get("flips", 0) > 0 or runtime.get("display_changes", 0) > 0
+        if drew and not runtime.get("crash"):
             level = "Game booted"
-            evidence["Game booted"] = runtime.get("frames", "reports/runtime_test.json")
+            evidence["Game booted"] = runtime.get("display_image") or "reports/runtime_test.json"
 
     unimpl = []
     if summary:
@@ -86,8 +100,24 @@ def build(work):
         "native_build": native,
         "runtime_test": runtime,
         "apk": apk,
+        # Reported, never counted towards the level (see the module docstring).
+        "compile_check": check,
+        "host": {"build": host_build, "runtime": _host_summary(host_run)} if (host_build or host_run) else None,
     }
     return report
+
+
+def _host_summary(r):
+    if not r:
+        return None
+    keep = ("platform", "entry_reached", "title_returned", "exit", "seconds", "flips",
+            "display_changes", "display_set", "selftest", "display_bmp", "log", "failed_step", "note")
+    out = {k: r.get(k) for k in keep if k in r}
+    out["crash"] = r.get("crash", [])[:20]
+    out["unimpl_reached"] = r.get("unimpl", [])[:20]
+    out["icall_failures"] = r.get("icall", [])[:20]
+    out["title_lines"] = r.get("title_lines", [])[:40]
+    return out
 
 
 def to_markdown(r):
@@ -143,11 +173,40 @@ def to_markdown(r):
         out.append("")
     rt = r.get("runtime_test")
     if rt:
-        out.append("## Runtime test (%s)" % rt.get("host", "?"))
-        for k in ("entry_reached", "frames_presented", "guest_progress", "exit"):
-            out.append("- %s: %s" % (k, rt.get(k)))
+        out.append("## Runtime test on %s" % rt.get("platform", "?"))
+        for k in ("device", "entry_reached", "flips", "display_changes", "exit"):
+            if k in rt:
+                out.append("- %s: %s" % (k, rt.get(k)))
+        for line in rt.get("crash", [])[:12]:
+            out.append("    %s" % line)
         for line in rt.get("title_lines", [])[:40]:
             out.append("    %s" % line)
+        out.append("")
+    ck = r.get("compile_check")
+    if ck:
+        out.append("## Compile-only check (not a build; does not count as Compiled)")
+        out.append("- %s: %s objects for %s, machines %s" % (
+            "ok" if ck.get("ok") else "FAILED", ck.get("objects"), ck.get("target"),
+            ", ".join(ck.get("machines", []))))
+        out.append("")
+    h = r.get("host")
+    if h:
+        out.append("## Desktop host check (not Android evidence)")
+        hb, hr = h.get("build") or {}, h.get("runtime") or {}
+        if hb:
+            out.append("- build: %s, %s, %s of %s guest functions linked" % (
+                hb.get("platform"), hb.get("machine"), hb.get("guest_functions"),
+                hb.get("expected_guest_functions")))
+        if hr:
+            out.append("- run: entry reached %s; %s after %ss; flips %s; scanout changes %s" % (
+                hr.get("entry_reached"), hr.get("exit"), hr.get("seconds"), hr.get("flips"),
+                hr.get("display_changes")))
+            if hr.get("selftest"):
+                out.append("- test-title self-test: %(pass)d pass, %(fail)d fail" % hr["selftest"])
+            for line in hr.get("crash", [])[:12]:
+                out.append("    %s" % line)
+            for line in hr.get("title_lines", [])[:20]:
+                out.append("    %s" % line)
         out.append("")
     return "\n".join(out) + "\n"
 

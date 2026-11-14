@@ -1,0 +1,243 @@
+name: Android pipeline
+
+# Original Xbox disc image -> Android arm64-v8a, on the self-built test title
+# (no game content; tools/android/testtitle) on every push, and on a disc
+# image YOU provide when started by hand (workflow_dispatch: iso_url +
+# iso_sha256, or the XBR_ISO_URL / XBR_ISO_SHA256 repository secrets).
+#
+# Each job publishes its result as a check run (tools/android/ci_report.py)
+# and uploads the work directory's reports and native libraries.
+
+on:
+  push:
+    branches: [ "arena/**", "main" ]
+    paths:
+      - "src/**"
+      - "tools/**"
+      - "templates/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/android.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "tools/**"
+      - "templates/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: "URL of your own disc image (an authorized copy). Leave empty to use the XBR_ISO_URL secret, or to run the test title only."
+        required: false
+        default: ""
+      iso_sha256:
+        description: "SHA-256 of that image (required with iso_url)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  checks: write
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  XBOXRECOMP_ANDROID_DEPS: ${{ github.workspace }}/build/android-deps
+  TESTTITLE_SHA256: 180edc50db6858e3b7c6821ed19130bfcfcde0bfeb73fe034293059df169dee2
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  android-arm64:
+    name: test title -> Android arm64-v8a (NDK) + Linux x86-64 run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pinned sources and host SDL2
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/android-deps/src
+            build/android-deps/host-sdl2
+          key: android-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/android/deps.lock.json') }}
+
+      - name: Bootstrap pinned dependencies (verified)
+        run: bash tools/android/bootstrap.sh --no-sdk --no-gradle --dev
+
+      - name: Check the runner's NDK against the pin
+        run: |
+          want=$(python3 -c "import json;print(json.load(open('tools/android/deps.lock.json'))['android']['ndk']['revision'])")
+          echo "pinned NDK $want; ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          grep Pkg.Revision "$ANDROID_HOME/ndk/$want/source.properties"
+          echo "XBOXRECOMP_NDK=$ANDROID_HOME/ndk/$want" >> "$GITHUB_ENV"
+
+      - name: Host SDL2 (pinned source) for the desktop run
+        run: |
+          if [ ! -f build/android-deps/host-sdl2/lib/cmake/SDL2/SDL2Config.cmake ]; then
+            cmake -S build/android-deps/src/SDL2 -B build/android-deps/host-sdl2-build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$PWD/build/android-deps/host-sdl2 -DSDL_TEST=OFF
+            ninja -C build/android-deps/host-sdl2-build install > /dev/null
+          fi
+
+      - name: Unit tests (Android tooling, locked-RMW lowering)
+        run: python3 -m pytest -q -p no:cacheprovider tools/android tools/recomp/test_lifter_locked_rmw.py 2>&1 | tee unit-tests.txt
+
+      - name: Build the test title (reproducible) and check its hash
+        run: |
+          python3 -m tools.android.testtitle.build
+          echo "$TESTTITLE_SHA256  build/testtitle/xbrtest.iso" | sha256sum -c -
+
+      - name: "Pipeline: intake -> analyze -> recompile -> project -> host -> native (NDK)"
+        run: |
+          python3 -m tools.android.pipeline run --source build/testtitle/xbrtest.iso \
+            --sha256 "$TESTTITLE_SHA256" --work build/games/xbrtest --to native \
+            --native-mode ndk --ndk "$XBOXRECOMP_NDK" --host-seconds 20
+
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m tools.android.ci_report --work build/games/xbrtest --name android-arm64 --post --note-file unit-tests.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xbrtest-android-arm64
+          path: |
+            build/games/xbrtest/reports
+            build/games/xbrtest/out
+            build/games/xbrtest/project/xbr_game.json
+            build/games/xbrtest/pipeline_state.json
+          if-no-files-found: warn
+
+  linux-arm64:
+    name: test title on Linux arm64 (generated code + runtime on AArch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pinned sources and host SDL2
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/android-deps/src
+            build/android-deps/host-sdl2
+          key: android-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/android/deps.lock.json') }}
+
+      - name: Bootstrap pinned dependencies (verified)
+        run: bash tools/android/bootstrap.sh --no-sdk --no-gradle --dev
+
+      - name: Host SDL2 (pinned source)
+        run: |
+          if [ ! -f build/android-deps/host-sdl2/lib/cmake/SDL2/SDL2Config.cmake ]; then
+            cmake -S build/android-deps/src/SDL2 -B build/android-deps/host-sdl2-build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$PWD/build/android-deps/host-sdl2 -DSDL_TEST=OFF
+            ninja -C build/android-deps/host-sdl2-build install > /dev/null
+          fi
+
+      - name: Build the test title (reproducible) and check its hash
+        run: |
+          python3 -m tools.android.testtitle.build
+          echo "$TESTTITLE_SHA256  build/testtitle/xbrtest.iso" | sha256sum -c -
+
+      - name: "Pipeline: intake -> ... -> host (AArch64 build and run)"
+        run: |
+          python3 -m tools.android.pipeline run --source build/testtitle/xbrtest.iso \
+            --sha256 "$TESTTITLE_SHA256" --work build/games/xbrtest --to host --host-seconds 20
+
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m tools.android.ci_report --work build/games/xbrtest --name linux-arm64 --post --note "runner: $(uname -m), page size $(getconf PAGESIZE)"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xbrtest-linux-arm64
+          path: |
+            build/games/xbrtest/reports
+            build/games/xbrtest/pipeline_state.json
+          if-no-files-found: warn
+
+  user-title:
+    name: your disc image -> Android arm64-v8a (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      ISO_URL: ${{ inputs.iso_url != '' && inputs.iso_url || secrets.XBR_ISO_URL }}
+      ISO_SHA256: ${{ inputs.iso_sha256 != '' && inputs.iso_sha256 || secrets.XBR_ISO_SHA256 }}
+    steps:
+      - name: Image source
+        id: src
+        run: |
+          if [ -z "$ISO_URL" ]; then
+            echo "No disc image given (iso_url input or XBR_ISO_URL secret); nothing to do."
+            echo "have=0" >> "$GITHUB_OUTPUT"
+          elif [ -z "$ISO_SHA256" ]; then
+            echo "::error::an image URL needs its SHA-256 (iso_sha256 input or XBR_ISO_SHA256 secret)"
+            exit 1
+          else
+            echo "have=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.src.outputs.have == '1'
+
+      - uses: actions/setup-python@v5
+        if: steps.src.outputs.have == '1'
+        with:
+          python-version: "3.12"
+
+      - name: Bootstrap pinned dependencies (verified)
+        if: steps.src.outputs.have == '1'
+        run: bash tools/android/bootstrap.sh --no-sdk --no-gradle --dev
+
+      - name: Host SDL2 (pinned source)
+        if: steps.src.outputs.have == '1'
+        run: |
+          cmake -S build/android-deps/src/SDL2 -B build/android-deps/host-sdl2-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$PWD/build/android-deps/host-sdl2 -DSDL_TEST=OFF
+          ninja -C build/android-deps/host-sdl2-build install > /dev/null
+
+      - name: "Pipeline on your image"
+        if: steps.src.outputs.have == '1'
+        run: |
+          want=$(python3 -c "import json;print(json.load(open('tools/android/deps.lock.json'))['android']['ndk']['revision'])")
+          python3 -m tools.android.pipeline run --source "$ISO_URL" --sha256 "$ISO_SHA256" \
+            --work build/games/user --to native --native-mode ndk --ndk "$ANDROID_HOME/ndk/$want" \
+            --host-seconds 60
+
+      - name: Report
+        if: always() && steps.src.outputs.have == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -m tools.android.ci_report --work build/games/user --name user-title --post
+
+      # Reports and libraries only: the extracted game files and the image
+      # never leave the runner.
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.src.outputs.have == '1'
+        with:
+          name: user-title-reports
+          path: |
+            build/games/user/reports
+            build/games/user/out
+            build/games/user/project/xbr_game.json
+            build/games/user/pipeline_state.json
+          if-no-files-found: warn

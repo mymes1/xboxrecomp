@@ -32,6 +32,14 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <limits.h>
+#if defined(__ANDROID__)
+/* [android-port] bionic has neither pthread_{get,set}affinity_np nor
+ * pthread_cancel, and memfd_create only from API 30; see the uses below. */
+#include <sys/syscall.h>
+/* <android/sharedmem.h> (libandroid, API 26), declared here so the file does
+ * not need the NDK's platform headers beyond libc. */
+extern int ASharedMemory_create(const char *name, size_t size);
+#endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -1054,7 +1062,12 @@ static void *thread_trampoline(void *arg)
         for (i = 0; i < (int)(8 * sizeof s_process_mask) && i < CPU_SETSIZE; i++)
             if (s_process_mask & ((DWORD_PTR)1 << i))
                 CPU_SET(i, &set);
+#if defined(__ANDROID__)
+        /* [android-port] bionic: the thread's kernel id is the target. */
+        sched_setaffinity(0, sizeof set, &set);
+#else
         pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#endif
     }
 #endif
 
@@ -1171,7 +1184,22 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
     w32_object *o = obj_from_handle(h);
     if (!o || o->kind != K_THREAD) return FALSE;
+#if defined(__ANDROID__)
+    /* [android-port] bionic has no pthread_cancel. Nothing in the runtime
+     * terminates a thread; a caller here gets the Win32-visible half (the
+     * handle signals, the exit code is set) and the host thread runs on
+     * until it returns, which is said once. */
+    {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[win32_compat] TerminateThread: no pthread_cancel on "
+                            "bionic; the thread is marked exited but keeps running\n");
+        }
+    }
+#else
     pthread_cancel(o->thread);
+#endif
     pthread_mutex_lock(&o->lock);
     o->exit_code = exitCode;
     o->exited    = 1;
@@ -1207,7 +1235,16 @@ DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
         DWORD_PTR prev = 0;
         cpu_set_t set;
         int i;
-        if (pthread_getaffinity_np(th, sizeof set, &set) == 0)
+#if defined(__ANDROID__)
+        /* [android-port] bionic: sched_*affinity on the thread's kernel id. */
+        pid_t tid = pthread_gettid_np(th);
+#define XBR_GETAFF(t, sz, st) sched_getaffinity(tid, (sz), (st))
+#define XBR_SETAFF(t, sz, st) sched_setaffinity(tid, (sz), (st))
+#else
+#define XBR_GETAFF(t, sz, st) pthread_getaffinity_np((t), (sz), (st))
+#define XBR_SETAFF(t, sz, st) pthread_setaffinity_np((t), (sz), (st))
+#endif
+        if (XBR_GETAFF(th, sizeof set, &set) == 0)
             for (i = 0; i < (int)(8 * sizeof prev) && i < CPU_SETSIZE; i++)
                 if (CPU_ISSET(i, &set))
                     prev |= (DWORD_PTR)1 << i;
@@ -1215,8 +1252,10 @@ DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
         for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
             if (mask & ((DWORD_PTR)1 << i))
                 CPU_SET(i, &set);
-        if (pthread_setaffinity_np(th, sizeof set, &set) != 0)
+        if (XBR_SETAFF(th, sizeof set, &set) != 0)
             return 0;
+#undef XBR_GETAFF
+#undef XBR_SETAFF
         return prev ? prev : mask;
     }
 #else
@@ -1569,20 +1608,25 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
-    /* Remember the length: VirtualFree(MEM_RELEASE) is passed size 0 by every
-     * Win32 caller, and munmap cannot be called without one. */
-    view_register(p, size);
-#if !defined(MAP_FIXED_NOREPLACE) && !defined(__APPLE__)
-    /* Older kernels without MAP_FIXED_NOREPLACE: plain MAP_FIXED would silently
-     * unmap whatever already lives there, so we pass the address as a hint and
-     * treat a different result as "taken". Apple goes through mach_map_fixed
-     * above, which reports that properly instead of inferring it. */
+#if !defined(__APPLE__)
+    /* Without MAP_FIXED_NOREPLACE plain MAP_FIXED would silently unmap
+     * whatever already lives there, so the address is passed as a hint and a
+     * different result is treated as "taken". Apple goes through
+     * mach_map_fixed above, which reports that properly instead of inferring
+     * it.
+     * [android-port] Checked even where the headers define
+     * MAP_FIXED_NOREPLACE: kernels before 4.17 (Android 8-10 devices) ignore
+     * the flag and hand back another address instead of failing. Checked
+     * before view_register, so a refused range leaves no stale entry. */
     if (address && p != address) {
         munmap(p, size);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
 #endif
+    /* Remember the length: VirtualFree(MEM_RELEASE) is passed size 0 by every
+     * Win32 caller, and munmap cannot be called without one. */
+    view_register(p, size);
     return p;
 }
 
@@ -1728,6 +1772,11 @@ VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
     memset_s(ptr, cnt, 0, cnt);
+#elif defined(__ANDROID__)
+    /* [android-port] bionic has no explicit_bzero: the barrier keeps the
+     * compiler from dropping the store as dead. */
+    memset(ptr, 0, cnt);
+    __asm__ __volatile__("" : : "r"(ptr) : "memory");
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -2039,9 +2088,35 @@ static int anon_map_fd(const char *name)
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
+#elif defined(__ANDROID__)
+    /* [android-port] memfd_create is in bionic from API 30 only; the system
+     * call itself is older (Linux 3.17), so ask the kernel directly. Where
+     * the kernel or the app sandbox refuses it, anon_map_fd_sized falls back
+     * to ASharedMemory (API 26). */
+    return (int)syscall(__NR_memfd_create, name ? name : "xbox_map", 0u);
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif
+}
+
+/* A descriptor of `size` bytes for CreateFileMapping. */
+static int anon_map_fd_sized(const char *name, SIZE_T size)
+{
+    int fd = anon_map_fd(name);
+    if (fd >= 0 && ftruncate(fd, (off_t)size) == 0)
+        return fd;
+    if (fd >= 0)
+        close(fd);
+#if defined(__ANDROID__)
+    /* [android-port] ashmem (or memfd on newer releases) behind the NDK's
+     * shared-memory API: sized at creation, mapped like any shared file, and
+     * every MAP_SHARED view of it aliases the same pages -- which is what the
+     * RAM mirrors need. ftruncate does not apply to it. */
+    fd = ASharedMemory_create(name ? name : "xbox_map", (size_t)size);
+    if (fd >= 0)
+        return fd;
+#endif
+    return -1;
 }
 
 HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
@@ -2051,13 +2126,10 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     SIZE_T size = ((SIZE_T)maxSizeHigh << 32) | maxSizeLow;
     if (size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
 
-    int fd = anon_map_fd(name);
+    /* [android-port] sized in one step: an ASharedMemory descriptor cannot
+     * be resized with ftruncate. Same behaviour elsewhere. */
+    int fd = anon_map_fd_sized(name, size);
     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
-    if (ftruncate(fd, (off_t)size) != 0) {
-        close(fd);
-        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return NULL;
-    }
 
     w32_object *o = obj_alloc(K_FILEMAP);
     o->fd       = fd;

@@ -134,9 +134,18 @@ def fetch_git(name, spec, deps_dir, check_only=False):
     log("%s: fetching %s @ %s" % (name, spec["url"], want))
     run(["git", "init", "-q", dest])
     run(["git", "-C", dest, "remote", "add", "origin", spec["url"]])
+    fetch = ["git", "-C", dest, "fetch", "-q", "--depth", "1"]
+    if spec.get("sparse"):
+        # Large repositories of which a few directories are needed (bionic's
+        # headers): a blobless fetch plus a sparse checkout downloads only the
+        # files under those paths. The commit id is still verified below.
+        run(["git", "-C", dest, "config", "remote.origin.promisor", "true"])
+        run(["git", "-C", dest, "config", "remote.origin.partialclonefilter", "blob:none"])
+        run(["git", "-C", dest, "sparse-checkout", "set", "--no-cone"] + list(spec["sparse"]))
+        fetch.append("--filter=blob:none")
     # GitHub serves any reachable commit by id; a shallow fetch of exactly the
     # pinned object keeps this fast and makes the tag irrelevant to what lands.
-    run(["git", "-C", dest, "fetch", "-q", "--depth", "1", "origin", want])
+    run(fetch + ["origin", want])
     run(["git", "-C", dest, "-c", "advice.detachedHead=false", "checkout", "-q", "FETCH_HEAD"])
     head = git_head(dest)
     if head != want:
@@ -352,7 +361,7 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--deps-dir", default=os.environ.get("XBOXRECOMP_ANDROID_DEPS", DEFAULT_DEPS))
     ap.add_argument("--only", default="git,sdk,gradle,python",
-                    help="comma list of: git, sdk, gradle, python, python-dev, archives")
+                    help="comma list of: git, git-dev, sdk, gradle, python, python-dev, archives")
     ap.add_argument("--check", action="store_true", help="verify only; fetch nothing")
     ap.add_argument("--lock", default=LOCK)
     args = ap.parse_args(argv)
@@ -381,6 +390,15 @@ def main(argv=None):
     if "git" in only:
         manifest.setdefault("git", {})
         for name, spec in lock["git"].items():
+            try:
+                manifest["git"][name] = fetch_git(name, spec, deps_dir, args.check)
+            except DepError as e:
+                errors.append(str(e))
+    if "git-dev" in only:
+        # Development-only sources (bionic headers for the compile-only ARM64
+        # check where no NDK can be installed). CI builds never need them.
+        manifest.setdefault("git", {})
+        for name, spec in (lock.get("git_dev") or {}).items():
             try:
                 manifest["git"][name] = fetch_git(name, spec, deps_dir, args.check)
             except DepError as e:

@@ -52,5 +52,10 @@ else()
     if(NOT APPLE)
         target_link_libraries(platform PUBLIC m)   # feclearexcept etc.; libSystem has them on macOS
     endif()
+    if(ANDROID)
+        # [android-port] ASharedMemory_create (libandroid) backs the guest RAM
+        # where memfd_create is refused; liblog receives stdout/stderr.
+        target_link_libraries(platform PUBLIC android log)
+    endif()
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()

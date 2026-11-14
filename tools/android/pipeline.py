@@ -15,8 +15,14 @@ says why):
              libraries, certificate, title image) -> reports/xbe_analysis.*
   recompile  the toolkit's disasm -> func_id -> abi_analysis -> recomp, into
              <work>/project/native/gen; recompilation summary + compatibility
-  project    the Android game project (native CMake + Gradle app)
-  native     NDK arm64-v8a build of the generated C, runtime and Vulkan back end
+  project    the per-game project: xbr_game.json (configuration) and the
+             native CMake project around the generated C (Gradle app: phase 7)
+  host       desktop build of the same project for this machine, then a
+             headless run of the title: generated code + runtime on a POSIX
+             host (reports/host_*.json; says nothing about Android)
+  native     Android arm64-v8a: the NDK build (libmain.so + libSDL2.so,
+             reports/native_build.json) or, with --native-mode check and no
+             NDK, a compile-only check against bionic headers
   apk        Gradle release build with the game files as assets
   verify     APK structure, ABI, ELF machine, required symbols, signature
 
@@ -43,9 +49,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from tools.android import compat, iso, xbe_info      # noqa: E402
+from tools.android import compat, iso, native, project, xbe_info      # noqa: E402
 
-STAGES = ["intake", "analyze", "recompile", "project", "native", "apk", "verify"]
+STAGES = ["intake", "analyze", "recompile", "project", "host", "native", "apk", "verify"]
 
 
 class StageError(Exception):
@@ -219,6 +225,72 @@ def stage_recompile(ctx):
             "untranslated_sites": rc["unimplemented_total"]}
 
 
+def _xbe_report(ctx):
+    rep = os.path.join(ctx.reports, "xbe_analysis.json")
+    if not os.path.exists(rep):
+        raise StageError("run analyze first (no reports/xbe_analysis.json)")
+    with open(rep, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def stage_project(ctx):
+    try:
+        cfg = project.generate(ctx.work, _xbe_report(ctx), ctx.args.game_config, log=ctx.log)
+    except project.ProjectError as e:
+        raise StageError(str(e))
+    return {"package": cfg["package"], "total_ram_mb": cfg["total_ram_mb"],
+            "env": cfg["env"], "app": "not generated yet (phase 7)"}
+
+
+def _native_run(ctx):
+    def run(name, cmd, cwd=None, env=None, timeout=None):
+        return ctx.run_tool(name, cmd, cwd=cwd or ROOT, env=env, timeout=timeout)
+    return run
+
+
+def stage_host(ctx):
+    try:
+        b = native.build_host(ctx.work, run=_native_run(ctx), log=ctx.log)
+        result = {"platform": b["platform"], "machine": b["machine"],
+                  "guest_functions": b["guest_functions"]}
+        if ctx.args.host_seconds:
+            r = native.run_host(ctx.work, seconds=ctx.args.host_seconds, log=ctx.log)
+            result.update(entry_reached=r["entry_reached"], exit=r["exit"], flips=r["flips"],
+                          display_changes=r["display_changes"], crash=bool(r["crash"]))
+            if r.get("selftest"):
+                result["selftest"] = r["selftest"]
+            if r["crash"]:
+                for line in r["crash"][:12]:
+                    ctx.log(line)
+    except native.NativeError as e:
+        raise StageError(str(e))
+    finally:
+        compat.write(ctx.work)
+    return result
+
+
+def stage_native(ctx):
+    mode = ctx.args.native_mode
+    run = _native_run(ctx)
+    try:
+        if mode == "auto":
+            ndk_dir, _rev = native.find_ndk(native.load_lock(), ctx.args.ndk)
+            mode = "ndk" if ndk_dir else "check"
+            ctx.log("native mode: %s (%s)" % (mode, ndk_dir or "no pinned NDK found"))
+        if mode == "ndk":
+            r = native.build_ndk(ctx.work, run=run, ndk=ctx.args.ndk, log=ctx.log)
+            result = {"mode": "ndk", "libraries": [l["name"] for l in r["libraries"]]}
+        else:
+            r = native.compile_check(ctx.work, run=run, log=ctx.log)
+            result = {"mode": "check", "objects": r["objects"],
+                      "note": "compile-only check; no Android library was built"}
+    except native.NativeError as e:
+        raise StageError(str(e))
+    finally:
+        compat.write(ctx.work)
+    return result
+
+
 def _not_yet(name):
     def stage(ctx):
         raise StageError("stage %r is not implemented yet in this build of the pipeline" % name)
@@ -229,8 +301,9 @@ STAGE_FUNCS = {
     "intake": stage_intake,
     "analyze": stage_analyze,
     "recompile": stage_recompile,
-    "project": _not_yet("project"),
-    "native": _not_yet("native"),
+    "project": stage_project,
+    "host": stage_host,
+    "native": stage_native,
     "apk": _not_yet("apk"),
     "verify": _not_yet("verify"),
 }
@@ -245,7 +318,7 @@ def run_stages(ctx, stages):
         try:
             result = STAGE_FUNCS[name](ctx) or {}
             entry.update(status="ok", result=result)
-        except (StageError, iso.IsoError) as e:
+        except (StageError, iso.IsoError, project.ProjectError, native.NativeError) as e:
             entry.update(status="failed", error=str(e))
             ctx.log("stage %s FAILED: %s" % (name, e))
         except Exception as e:      # a bug: keep the traceback in the log
@@ -273,6 +346,14 @@ def main(argv=None):
     r.add_argument("--to", dest="stop", choices=STAGES, default="verify")
     r.add_argument("--only", choices=STAGES)
     r.add_argument("--split", type=int, default=250, help="functions per generated C file")
+    r.add_argument("--game-config", help="project: a profile JSON merged into xbr_game.json")
+    r.add_argument("--host-seconds", type=int, default=20,
+                   help="host: run the title headless this long (0 = build only)")
+    r.add_argument("--native-mode", choices=["auto", "ndk", "check"], default="auto",
+                   help="native: NDK build, compile-only check, or whichever is possible")
+    r.add_argument("--ndk", help="native: NDK directory (default: ANDROID_NDK_HOME etc.)")
+    r.add_argument("--skip", action="append", default=[], choices=STAGES,
+                   help="leave a stage out of the run (repeatable), e.g. --skip host")
     s = sub.add_parser("status", help="show stage results")
     s.add_argument("--work", required=True)
     args = ap.parse_args(argv)
@@ -295,6 +376,7 @@ def main(argv=None):
         stages = [args.only]
     else:
         stages = STAGES[STAGES.index(args.start):STAGES.index(args.stop) + 1]
+        stages = [st for st in stages if st not in args.skip]
     ok = run_stages(ctx, stages)
     return 0 if ok else 1
 

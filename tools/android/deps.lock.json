@@ -74,5 +74,27 @@
       "host": "linux-x86_64",
       "used_for": "regenerating the committed SPIR-V of src/vulkan/shaders (scripts/gen_spirv.py); builds do not need it"
     }
+  },
+  "git_dev": {
+    "bionic-headers": {
+      "url": "https://github.com/aosp-mirror/platform_bionic.git",
+      "commit": "731631f300090436d7f5df80d50b6275c8c60a93",
+      "sparse": [
+        "libc/include",
+        "libc/kernel/uapi",
+        "libc/kernel/android/uapi"
+      ],
+      "license": "BSD-2-Clause (bionic libc headers); kernel uapi headers carry their own notices",
+      "used_for": "compile-only ARM64/bionic API-level check of the runtime and generated code where no NDK can be installed (tools/android/native.py --mode check). Never linked; the NDK sysroot is authoritative on CI."
+    },
+    "liblog-headers": {
+      "url": "https://github.com/LineageOS/android_system_logging.git",
+      "commit": "336e1707c8258adf1f1c5c5511218b533f3a22e8",
+      "sparse": [
+        "liblog/include"
+      ],
+      "license": "Apache-2.0",
+      "used_for": "<android/log.h> for the compile-only check (the NDK sysroot ships the same public header; AOSP's own repository is not on GitHub, LineageOS mirrors it). Never linked."
+    }
   }
 }
