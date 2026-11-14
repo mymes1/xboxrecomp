@@ -78,6 +78,12 @@ int xbr_boot_run(const XbrBootOptions *opts);
 /* Last boot step reached, for a host that reports progress. */
 const char *xbr_boot_stage(void);
 
+/* Where the crash handler's report goes besides stderr: a host whose stderr
+ * is a pipe drained by a thread (Android: logcat) sets this so the report is
+ * written synchronously before the process dies. Must be async-signal-tolerant
+ * (no locks the faulting thread may hold). */
+extern void (*xbr_crash_sink)(const char *line);
+
 /* What the title is showing (src/host/xbr_stats.c). */
 typedef struct XbrStats {
     uint64_t flips;            /* pushbuffer flips the executor completed */

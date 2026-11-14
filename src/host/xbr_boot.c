@@ -100,6 +100,8 @@ void xbr_boot_env_defaults(void)
 
 static volatile sig_atomic_t s_in_handler;
 
+void (*xbr_crash_sink)(const char *line);
+
 static void crash_write(const char *fmt, ...)
 {
     char buf[512];
@@ -111,6 +113,8 @@ static void crash_write(const char *fmt, ...)
     if (n > 0) {
         ssize_t r = write(2, buf, (size_t)n < sizeof buf ? (size_t)n : sizeof buf - 1);
         (void)r;
+        if (xbr_crash_sink)
+            xbr_crash_sink(buf);
     }
 }
 
@@ -166,8 +170,11 @@ static void crash_handler(int sig, siginfo_t *si, void *ucv)
                     info.dli_fname ? info.dli_fname : "?");
     if (g_xbox_mem_offset && addr >= (uintptr_t)g_xbox_mem_offset
             && addr - (uintptr_t)g_xbox_mem_offset < 0x100000000ull)
-        crash_write("[CRASH]   guest address 0x%08X\n",
-                    (unsigned)(addr - (uintptr_t)g_xbox_mem_offset));
+        crash_write("[CRASH]   guest address 0x%08X (si_code %d)\n",
+                    (unsigned)(addr - (uintptr_t)g_xbox_mem_offset), si->si_code);
+    else
+        crash_write("[CRASH]   not a guest address (guest memory at %p, si_code %d)\n",
+                    (void *)(uintptr_t)g_xbox_mem_offset, si->si_code);
     crash_write("[CRASH]   guest eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X esp=%08X\n",
                 g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_esp);
     if (g_xbox_mem_offset && g_esp) {

@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "xbr_android.h"
+#include "xbr_host.h"
 
 static int s_pipe[2] = { -1, -1 };
 static pthread_t s_thread;
@@ -81,6 +82,17 @@ static void *forward(void *arg)
     return NULL;
 }
 
+/* The crash handler's lines, straight to logd and the log file: the
+ * forwarder thread may never run again once a thread has faulted. */
+static void crash_sink(const char *line)
+{
+    __android_log_write(ANDROID_LOG_FATAL, s_tag, line);
+    if (s_copy) {
+        ssize_t r = write(fileno(s_copy), line, strlen(line));
+        (void)r;
+    }
+}
+
 int xbr_android_log_start(const char *tag, const char *copy_path)
 {
     if (s_started)
@@ -101,6 +113,7 @@ int xbr_android_log_start(const char *tag, const char *copy_path)
     }
     pthread_detach(s_thread);
     s_started = 1;
+    xbr_crash_sink = crash_sink;
     return 0;
 }
 

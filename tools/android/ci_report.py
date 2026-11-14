@@ -67,6 +67,23 @@ def summarize(work, name, extra=None):
         keep["status"] = hr.get("status", [])[-4:]
         out.append("## host_runtime.json (excerpt)")
         out.append("```json\n%s\n```" % json.dumps(keep, indent=1)[:9000])
+    rt = _load(os.path.join(rep, "runtime_test.json"))
+    if rt:
+        keep = {k: rt.get(k) for k in ("platform", "execution", "device", "install", "entry_reached",
+                                       "exit", "seconds", "flips", "display_changes", "selftest",
+                                       "failed_step", "game_process_alive_at_end")}
+        keep["boot"] = rt.get("boot", [])[-30:]
+        keep["crash"] = rt.get("crash", [])[:40]
+        keep["fatal_lines"] = rt.get("fatal_lines", [])[:20]
+        keep["title_lines"] = rt.get("title_lines", [])[:30]
+        keep["status"] = rt.get("status", [])[-4:]
+        out.append("## runtime_test.json (excerpt)")
+        out.append("```json\n%s\n```" % json.dumps(keep, indent=1)[:12000])
+        if rt.get("crash_buffer"):
+            out.append("## crash buffer")
+            out.append("```\n%s\n```" % "\n".join(rt["crash_buffer"][:80]))
+        out.append("## device runtime log tail")
+        out.append("```\n%s\n```" % "\n".join(_tail(os.path.join(rep, "logs", "device_runtime.log"), 120)))
     compat = os.path.join(rep, "compatibility.md")
     if os.path.exists(compat):
         with open(compat, encoding="utf-8") as f:
