@@ -1,0 +1,15 @@
+# Python inputs of the ISO -> APK pipeline, hash-locked.
+#   python3 -m pip install --require-hashes -r tools/android/requirements-pipeline.txt
+# Hashes are the PyPI wheels for Linux x86_64 and aarch64 (the CI runners and
+# a Linux/ARM workstation). Regenerate with the PyPI JSON API when a pin moves.
+capstone==5.0.9 \
+    --hash=sha256:273fd8d747d2e35c88f91450be51a603ecfaafb00d96d9f315dcb8689c86193e \
+    --hash=sha256:41772ad0c71aa5d3e97d541e802593c2e71fb94ac7e20d4202f97ce2a3eb8ed5 \
+    --hash=sha256:0429af292ddc604d3c9344696807e281d5e728db029f00e6a4ea9e3bff1aac9e
+cmake==3.31.6 \
+    --hash=sha256:2297e9591307d9c61e557efe737bcf4d7c13a30f1f860732f684a204fee24dca \
+    --hash=sha256:1c8b05df0602365da91ee6a3336fe57525b137706c4ab5675498f662ae1dbcec \
+    --hash=sha256:42d9883b8958da285d53d5f69d40d9650c2d1bcf922d82b3ebdceb2b3a7d4521
+ninja==1.13.0 \
+    --hash=sha256:fb46acf6b93b8dd0322adc3a4945452a4e774b75b91293bafcc7b7f8e6517dfa \
+    --hash=sha256:3d00c692fb717fd511abeb44b8c5d00340c36938c12d6538ba989fe764e79630

@@ -49,9 +49,17 @@ if(WIN32)
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
 else()
-    # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
-    find_package(OpenSSL REQUIRED)
-    target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+    # POSIX: platform layer (POSIX host primitives). kernel_crypto.c carries
+    # its own SHA-1/RC4/HMAC, so nothing in the kernel calls OpenSSL; it is
+    # still linked where present so a consumer that leaned on the old PUBLIC
+    # dependency keeps it. Android (no system OpenSSL in the NDK) and minimal
+    # hosts build without it. [android-port: was find_package(... REQUIRED)]
+    find_package(OpenSSL QUIET)
+    if(OpenSSL_FOUND AND NOT ANDROID)
+        target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+    else()
+        target_link_libraries(xbox_kernel PUBLIC platform)
+    endif()
 endif()
 
 if(MSVC)
