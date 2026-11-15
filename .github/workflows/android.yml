@@ -171,7 +171,7 @@ jobs:
           target: google_apis
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: python3 -m tools.android.device_run --work build/games/xbrtest --seconds 90 || echo "device run reported a failure"
+          script: python3 -m tools.android.device_run --work build/games/xbrtest --seconds 90 --lifecycle || echo "device run reported a failure"
 
       - name: Report
         if: always()
@@ -296,6 +296,12 @@ jobs:
           RECOMP_VK_STATS=1000000 RECOMP_VK_TEST_OUT=build/vk-test-out \
             ./build/tests/nv2a_vk_backend/nv2a-vk-backend-test 2>&1 \
             | grep -v '^ *\[GPU\]' | tee build/vk-test-out/result.txt
+          # The window presenter on a headless surface (swapchain, letterbox,
+          # suspend/resume, the renderer on the presenter's device).
+          VK_ICD_FILENAMES="$XBOXRECOMP_SWIFTSHADER_ICD" \
+          LD_LIBRARY_PATH="$XBOXRECOMP_SWIFTSHADER_DIR" \
+            ./build/tests/nv2a_vk_backend/nv2a-vk-present-test 2>&1 \
+            | grep -v '^ *\[GPU\]' | tee -a build/vk-test-out/result.txt
 
       # The step summary is only visible in the web UI; the check run can be
       # read through the checks API, which is how results are verified.
@@ -306,7 +312,7 @@ jobs:
         run: |
           python3 -m tools.android.ci_report --name vulkan-backend --post \
             --text-file build/vk-test-out/result.txt --outcome "${{ steps.vktest.outcome }}" \
-            --note "Vulkan back end vs the CPU rasteriser on SwiftShader (a CPU Vulkan device): not evidence about a phone GPU."
+            --note "Vulkan back end vs the CPU rasteriser, and the window presenter on a headless surface, on SwiftShader (a CPU Vulkan device): not evidence about a phone GPU."
 
       - uses: actions/upload-artifact@v4
         if: always()

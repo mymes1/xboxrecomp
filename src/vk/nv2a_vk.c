@@ -47,6 +47,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <unistd.h>
 #include <time.h>
@@ -74,6 +75,8 @@ ptrdiff_t xbox_GetMemoryOffset(void);      /* xbox_memory_layout.h */
 
 #define NVK_DEVICE_FNS(X)                                                      \
     X(DestroyDevice) X(GetDeviceQueue) X(QueueSubmit) X(DeviceWaitIdle)        \
+    X(CmdBlitImage) X(CmdClearColorImage) X(CreateSemaphore) X(DestroySemaphore)\
+    X(ResetCommandBuffer)                                                      \
     X(AllocateMemory) X(FreeMemory) X(MapMemory) X(UnmapMemory)                \
     X(InvalidateMappedMemoryRanges) X(BindBufferMemory) X(BindImageMemory)     \
     X(GetBufferMemoryRequirements) X(GetImageMemoryRequirements)               \
@@ -100,6 +103,18 @@ ptrdiff_t xbox_GetMemoryOffset(void);      /* xbox_memory_layout.h */
     X(CmdClearDepthStencilImage) X(CmdPipelineBarrier) X(CmdPushConstants)     \
     X(CmdBeginRenderPass) X(CmdEndRenderPass)
 
+/* Window presentation only: VK_KHR_surface (instance) and VK_KHR_swapchain
+ * (device), loaded when a window asked for them (nv2a_vk_present_init). */
+#define NVK_SURFACE_FNS(X)                                                     \
+    X(DestroySurfaceKHR) X(GetPhysicalDeviceSurfaceSupportKHR)                 \
+    X(GetPhysicalDeviceSurfaceCapabilitiesKHR)                                 \
+    X(GetPhysicalDeviceSurfaceFormatsKHR)                                      \
+    X(GetPhysicalDeviceSurfacePresentModesKHR)
+
+#define NVK_SWAPCHAIN_FNS(X)                                                   \
+    X(CreateSwapchainKHR) X(DestroySwapchainKHR) X(GetSwapchainImagesKHR)      \
+    X(AcquireNextImageKHR) X(QueuePresentKHR)
+
 static struct {
     PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
     PFN_vkCreateInstance CreateInstance;
@@ -108,8 +123,14 @@ static struct {
 #define NVK_FN(n) PFN_vk##n n;
     NVK_INSTANCE_FNS(NVK_FN)
     NVK_DEVICE_FNS(NVK_FN)
+    NVK_SURFACE_FNS(NVK_FN)
+    NVK_SWAPCHAIN_FNS(NVK_FN)
 #undef NVK_FN
 } vk;
+
+/* The one queue is shared by the executor (rendering) and the window thread
+ * (presenting): every queue call, and vkDeviceWaitIdle, holds this. */
+static pthread_mutex_t s_qlock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---- state -------------------------------------------------------------- */
 
@@ -208,8 +229,9 @@ typedef struct {
 } NvkPush;
 
 static struct {
-    int ok, registered, init_tried;
+    int ok, registered, init_tried, renderer_tried;
     char status[768];
+    char devdesc[400], feat[96];
     void *lib;
     VkInstance inst;
     VkPhysicalDevice phys;
@@ -287,6 +309,22 @@ static int ck(VkResult r, const char *what)
         return 1;
     nvk_fail(what, r);
     return 0;
+}
+
+static VkResult q_submit(const VkSubmitInfo *si, VkFence fence)
+{
+    VkResult r;
+    pthread_mutex_lock(&s_qlock);
+    r = vk.QueueSubmit(V.queue, 1, si, fence);
+    pthread_mutex_unlock(&s_qlock);
+    return r;
+}
+
+static void dev_idle(void)
+{
+    pthread_mutex_lock(&s_qlock);
+    vk.DeviceWaitIdle(V.dev);
+    pthread_mutex_unlock(&s_qlock);
 }
 
 static uint8_t *guest(uint32_t addr)
@@ -469,7 +507,7 @@ static void img_destroy_later(NvkImage *im)
         int cap = V.dead_img_cap ? V.dead_img_cap * 2 : 16;
         NvkImage *n = (NvkImage *)realloc(V.dead_img, (size_t)cap * sizeof *n);
         if (!n) {                           /* out of memory: wait instead */
-            vk.DeviceWaitIdle(V.dev);
+            dev_idle();
             img_destroy_now(im);
             return;
         }
@@ -492,7 +530,7 @@ static void fb_destroy_later(VkFramebuffer fb)
         int cap = V.dead_fb_cap ? V.dead_fb_cap * 2 : 16;
         VkFramebuffer *n = (VkFramebuffer *)realloc(V.dead_fb, (size_t)cap * sizeof *n);
         if (!n) {
-            vk.DeviceWaitIdle(V.dev);
+            dev_idle();
             vk.DestroyFramebuffer(V.dev, fb, NULL);
             return;
         }
@@ -597,7 +635,7 @@ static int submit_wait(void)
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.commandBufferCount = 1;
         si.pCommandBuffers = &V.cmd;
-        if (!ck(vk.QueueSubmit(V.queue, 1, &si, V.fence), "vkQueueSubmit"))
+        if (!ck(q_submit(&si, V.fence), "vkQueueSubmit"))
             return 0;
         if (!ck(vk.WaitForFences(V.dev, 1, &V.fence, VK_TRUE, UINT64_MAX),
                 "vkWaitForFences"))
@@ -2181,6 +2219,869 @@ static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
     return 0;
 }
 
+/* ==== window presentation ================================================= */
+
+/* [android-port] Frames reach the screen through a Vulkan swapchain on the
+ * device the renderer uses, rather than through the SDL renderer (GLES on
+ * Android). The window thread hands over each finished frame from guest
+ * memory -- where the flip's present_sync has just written it back -- and
+ * it is uploaded, scaled into the window with a blit (4:3 letterboxed by
+ * default) and presented. Guest memory stays the one source of truth, so
+ * frames the CPU rasteriser or the title itself drew show the same way.
+ *
+ * Threads: the window thread presents, the executor renders. They share the
+ * device and the one queue (s_qlock); the presenter has its own command
+ * pool, fences, semaphores and error state, so a presenter failure never
+ * switches the renderer off. */
+
+#define NVK_PRESENT_MAX_IMAGES 16
+
+typedef struct {
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    void *map;
+    VkDeviceSize size;
+} NvkPBuf;
+
+typedef struct {
+    VkImage img;
+    VkDeviceMemory mem;
+    uint32_t w, h;
+    VkFormat fmt;
+} NvkPImg;
+
+static struct {
+    /* the request, made before the device exists */
+    int wanted;
+    const char *exts[8];
+    uint32_t next;
+    Nv2aVkSurfaceFn create_surface;
+    void *ctx;
+    uint32_t want_w, want_h;
+    int have_surface_ext, have_swapchain_ext, can_present;
+    /* state */
+    int ok;                         /* frames can be presented (now or later) */
+    int suspended, need_swapchain;
+    VkSurfaceKHR surface;
+    VkSwapchainKHR swapchain;
+    VkFormat format;
+    VkExtent2D extent;
+    VkImageUsageFlags usage;
+    VkCompositeAlphaFlagBitsKHR alpha;
+    VkPresentModeKHR mode;
+    VkSurfaceTransformFlagBitsKHR transform;
+    uint32_t nimg;
+    VkImage img[NVK_PRESENT_MAX_IMAGES];
+    VkSemaphore done[NVK_PRESENT_MAX_IMAGES];
+    VkCommandPool pool;
+    VkCommandBuffer cmd[2];
+    VkFence fence[2];
+    int pending[2];
+    VkSemaphore acq[2];
+    NvkPBuf staging[2];
+    NvkPImg src[2];
+    NvkPBuf cap;                    /* tests: a copy of the last presented image */
+    int capture, cap_valid, cap_slot;
+    uint32_t cap_w, cap_h;
+    uint32_t frame;
+    int vsync, linear;
+    double aspect;                  /* display aspect; 0 = stretch, <0 = the frame's */
+    uint64_t presents, skipped, swapchains, suspends;
+    char status[384];
+} P;
+
+static int p_off(const char *fmt, ...)
+{
+    va_list ap;
+    int n = snprintf(P.status, sizeof P.status, "off: ");
+    va_start(ap, fmt);
+    vsnprintf(P.status + n, sizeof P.status - (size_t)n, fmt, ap);
+    va_end(ap);
+    P.ok = 0;
+    nvk_log("presenter %s", P.status);
+    return -1;
+}
+
+static void p_read_env(void)
+{
+    const char *e = getenv("RECOMP_PRESENT_VSYNC");
+    P.vsync = !e || strcmp(e, "0") != 0;
+    e = getenv("RECOMP_PRESENT_FILTER");
+    P.linear = !(e && !strcmp(e, "nearest"));
+    P.aspect = 4.0 / 3.0;
+    e = getenv("RECOMP_ASPECT");
+    if (e && *e) {
+        unsigned a = 0, b = 0;
+        if (!strcmp(e, "stretch"))
+            P.aspect = 0;
+        else if (!strcmp(e, "native") || !strcmp(e, "source"))
+            P.aspect = -1;
+        else if (sscanf(e, "%u:%u", &a, &b) == 2 && a && b)
+            P.aspect = (double)a / (double)b;
+    }
+}
+
+static const char *p_fmt_name(VkFormat f)
+{
+    switch (f) {
+    case VK_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+    case VK_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return "A8B8G8R8_UNORM";
+    case VK_FORMAT_B8G8R8A8_SRGB: return "B8G8R8A8_SRGB";
+    case VK_FORMAT_R8G8B8A8_SRGB: return "R8G8B8A8_SRGB";
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return "A8B8G8R8_SRGB";
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return "A2B10G10R10_UNORM";
+    case VK_FORMAT_R5G6B5_UNORM_PACK16: return "R5G6B5_UNORM";
+    default: return "another format";
+    }
+}
+
+static void p_buf_free(NvkPBuf *b)
+{
+    if (b->map)
+        vk.UnmapMemory(V.dev, b->mem);
+    if (b->buf)
+        vk.DestroyBuffer(V.dev, b->buf, NULL);
+    if (b->mem)
+        vk.FreeMemory(V.dev, b->mem, NULL);
+    memset(b, 0, sizeof *b);
+}
+
+/* Host-visible and coherent; `readback` prefers cached memory. */
+static int p_buf(NvkPBuf *b, VkDeviceSize size, VkBufferUsageFlags usage, int readback)
+{
+    VkBufferCreateInfo ci;
+    VkMemoryRequirements req;
+    VkMemoryAllocateInfo ai;
+    int t = -1;
+
+    memset(b, 0, sizeof *b);
+    memset(&ci, 0, sizeof ci);
+    ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    ci.size = size;
+    ci.usage = usage;
+    ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vk.CreateBuffer(V.dev, &ci, NULL, &b->buf) != VK_SUCCESS)
+        return 0;
+    vk.GetBufferMemoryRequirements(V.dev, b->buf, &req);
+    if (readback)
+        t = mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                             | VK_MEMORY_PROPERTY_HOST_CACHED_BIT
+                                             | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (t < 0)
+        t = mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                             | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    memset(&ai, 0, sizeof ai);
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = (uint32_t)t;
+    if (t < 0 || vk.AllocateMemory(V.dev, &ai, NULL, &b->mem) != VK_SUCCESS
+        || vk.BindBufferMemory(V.dev, b->buf, b->mem, 0) != VK_SUCCESS
+        || vk.MapMemory(V.dev, b->mem, 0, VK_WHOLE_SIZE, 0, &b->map) != VK_SUCCESS) {
+        p_buf_free(b);
+        return 0;
+    }
+    b->size = size;
+    return 1;
+}
+
+static void p_img_free(NvkPImg *im)
+{
+    if (im->img)
+        vk.DestroyImage(V.dev, im->img, NULL);
+    if (im->mem)
+        vk.FreeMemory(V.dev, im->mem, NULL);
+    memset(im, 0, sizeof *im);
+}
+
+static int p_img(NvkPImg *im, uint32_t w, uint32_t h, VkFormat fmt)
+{
+    VkImageCreateInfo ci;
+    VkMemoryRequirements req;
+    VkMemoryAllocateInfo ai;
+    int t;
+
+    memset(im, 0, sizeof *im);
+    memset(&ci, 0, sizeof ci);
+    ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = fmt;
+    ci.extent.width = w;
+    ci.extent.height = h;
+    ci.extent.depth = 1;
+    ci.mipLevels = 1;
+    ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vk.CreateImage(V.dev, &ci, NULL, &im->img) != VK_SUCCESS)
+        return 0;
+    vk.GetImageMemoryRequirements(V.dev, im->img, &req);
+    t = mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (t < 0)
+        t = mem_type(req.memoryTypeBits, 0);
+    memset(&ai, 0, sizeof ai);
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = (uint32_t)t;
+    if (t < 0 || vk.AllocateMemory(V.dev, &ai, NULL, &im->mem) != VK_SUCCESS
+        || vk.BindImageMemory(V.dev, im->img, im->mem, 0) != VK_SUCCESS) {
+        p_img_free(im);
+        return 0;
+    }
+    im->w = w;
+    im->h = h;
+    im->fmt = fmt;
+    return 1;
+}
+
+static void p_wait_slots(void)
+{
+    int i;
+    for (i = 0; i < 2; i++)
+        if (P.pending[i]) {
+            vk.WaitForFences(V.dev, 1, &P.fence[i], VK_TRUE, UINT64_MAX);
+            vk.ResetFences(V.dev, 1, &P.fence[i]);
+            P.pending[i] = 0;
+        }
+}
+
+static void p_swapchain_destroy(void)
+{
+    uint32_t i;
+
+    if (!P.swapchain)
+        return;
+    /* Every blit and present that used its images is done. */
+    dev_idle();
+    p_wait_slots();
+    for (i = 0; i < P.nimg; i++)
+        if (P.done[i]) {
+            vk.DestroySemaphore(V.dev, P.done[i], NULL);
+            P.done[i] = VK_NULL_HANDLE;
+        }
+    vk.DestroySwapchainKHR(V.dev, P.swapchain, NULL);
+    P.swapchain = VK_NULL_HANDLE;
+    P.nimg = 0;
+    P.cap_valid = 0;
+}
+
+static void p_surface_destroy(void)
+{
+    p_swapchain_destroy();
+    if (P.surface && V.inst && vk.DestroySurfaceKHR)
+        vk.DestroySurfaceKHR(V.inst, P.surface, NULL);
+    P.surface = VK_NULL_HANDLE;
+}
+
+/* The window system's surface for the window, through the host's callback.
+ * Before a device is chosen, pick_device checks it can be presented to.
+ * `quiet`: no window yet is not a failure (Android, just after a resume). */
+static int p_surface_create_q(int quiet)
+{
+    uint64_t s = 0;
+    VkBool32 sup = VK_FALSE;
+
+    if (P.create_surface(P.ctx, (void *)V.inst, &s) != 0 || !s)
+        return quiet ? -1 : p_off("the window system made no Vulkan surface");
+    memcpy(&P.surface, &s, sizeof P.surface);
+    if (V.dev) {
+        if (vk.GetPhysicalDeviceSurfaceSupportKHR(V.phys, V.qfam, P.surface, &sup) != VK_SUCCESS
+            || !sup)
+            return p_off("the graphics queue cannot present to the window");
+    }
+    return 0;
+}
+
+static int p_surface_create(void)
+{
+    return p_surface_create_q(0);
+}
+
+static int p_format_ok(VkFormat f)
+{
+    VkFormatProperties fp;
+    vk.GetPhysicalDeviceFormatProperties(V.phys, f, &fp);
+    return (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
+}
+
+/* 1 made, 0 not now (no surface, a zero-sized window: try again later),
+ * negative: the presenter is off. */
+static int p_swapchain_create(void)
+{
+    static const VkFormat pref[] = {
+        VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_A8B8G8R8_UNORM_PACK32,
+        VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_A8B8G8R8_SRGB_PACK32,
+    };
+    VkSurfaceCapabilitiesKHR caps;
+    VkSurfaceFormatKHR fmts[64];
+    VkPresentModeKHR modes[16];
+    VkSwapchainCreateInfoKHR ci;
+    VkSemaphoreCreateInfo si;
+    uint32_t nf = 64, nm = 16, i, k, want;
+    VkResult r;
+    int found = 0;
+
+    if (!P.surface)
+        return 0;
+    r = vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(V.phys, P.surface, &caps);
+    if (r == VK_ERROR_SURFACE_LOST_KHR) {
+        p_surface_destroy();
+        return 0;
+    }
+    if (r != VK_SUCCESS)
+        return p_off("vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed (VkResult %d)", (int)r);
+    if (caps.currentExtent.width != 0xFFFFFFFFu) {
+        P.extent = caps.currentExtent;
+    } else {
+        P.extent.width = P.want_w;
+        P.extent.height = P.want_h;
+        if (P.extent.width < caps.minImageExtent.width) P.extent.width = caps.minImageExtent.width;
+        if (P.extent.height < caps.minImageExtent.height) P.extent.height = caps.minImageExtent.height;
+        if (P.extent.width > caps.maxImageExtent.width) P.extent.width = caps.maxImageExtent.width;
+        if (P.extent.height > caps.maxImageExtent.height) P.extent.height = caps.maxImageExtent.height;
+    }
+    if (!P.extent.width || !P.extent.height) {
+        P.need_swapchain = 1;               /* minimised: later */
+        return 0;
+    }
+    if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        return p_off("the window's images cannot be written by transfers");
+    P.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (P.capture && (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+        P.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
+    r = vk.GetPhysicalDeviceSurfaceFormatsKHR(V.phys, P.surface, &nf, fmts);
+    if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || !nf)
+        return p_off("the window offers no formats (VkResult %d)", (int)r);
+    if (nf == 1 && fmts[0].format == VK_FORMAT_UNDEFINED) {
+        P.format = VK_FORMAT_B8G8R8A8_UNORM;
+        found = 1;
+    }
+    /* UNORM first: the frames are already display-encoded, and a blit into
+     * an sRGB image would encode them a second time. */
+    for (k = 0; k < sizeof pref / sizeof pref[0] && !found; k++)
+        for (i = 0; i < nf && !found; i++)
+            if (fmts[i].format == pref[k] && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+                && p_format_ok(pref[k])) {
+                P.format = pref[k];
+                found = 1;
+            }
+    if (!found)
+        return p_off("none of the window's %u formats is an 8-bit RGBA one a blit can write", nf);
+
+    P.alpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
+                  ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+            : (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)
+                  ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
+                  : (VkCompositeAlphaFlagBitsKHR)(caps.supportedCompositeAlpha
+                                                  & (~caps.supportedCompositeAlpha + 1));
+    /* A half turn is pre-rotated (the blit reverses both axes, p_present);
+     * a quarter turn cannot be done by a blit, so the compositor rotates
+     * those frames: correct, if a little slower. */
+    if (caps.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR
+        && (caps.supportedTransforms & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR))
+        P.transform = VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR;
+    else if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+        P.transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    else
+        return p_off("the window does not accept unrotated frames (transforms 0x%X)",
+                     (unsigned)caps.supportedTransforms);
+    P.mode = VK_PRESENT_MODE_FIFO_KHR;      /* always there: vsync */
+    if (!P.vsync) {
+        r = vk.GetPhysicalDeviceSurfacePresentModesKHR(V.phys, P.surface, &nm, modes);
+        if (r == VK_SUCCESS || r == VK_INCOMPLETE) {
+            for (i = 0; i < nm; i++)
+                if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR)
+                    P.mode = modes[i];
+            if (P.mode == VK_PRESENT_MODE_FIFO_KHR)
+                for (i = 0; i < nm; i++)
+                    if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR)
+                        P.mode = modes[i];
+        }
+    }
+    want = caps.minImageCount + 1;
+    if (want < 2)
+        want = 2;
+    if (caps.maxImageCount && want > caps.maxImageCount)
+        want = caps.maxImageCount;
+    if (want > NVK_PRESENT_MAX_IMAGES)
+        want = NVK_PRESENT_MAX_IMAGES;
+
+    memset(&ci, 0, sizeof ci);
+    ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    ci.surface = P.surface;
+    ci.minImageCount = want;
+    ci.imageFormat = P.format;
+    ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    ci.imageExtent = P.extent;
+    ci.imageArrayLayers = 1;
+    ci.imageUsage = P.usage;
+    ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ci.preTransform = P.transform;
+    ci.compositeAlpha = P.alpha;
+    ci.presentMode = P.mode;
+    ci.clipped = VK_TRUE;
+    r = vk.CreateSwapchainKHR(V.dev, &ci, NULL, &P.swapchain);
+    if (r == VK_ERROR_SURFACE_LOST_KHR || r == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) {
+        P.swapchain = VK_NULL_HANDLE;
+        if (r == VK_ERROR_SURFACE_LOST_KHR)
+            p_surface_destroy();
+        else
+            P.need_swapchain = 1;
+        return 0;
+    }
+    if (r != VK_SUCCESS) {
+        P.swapchain = VK_NULL_HANDLE;
+        return p_off("vkCreateSwapchainKHR failed (VkResult %d)", (int)r);
+    }
+    P.nimg = NVK_PRESENT_MAX_IMAGES;
+    r = vk.GetSwapchainImagesKHR(V.dev, P.swapchain, &P.nimg, P.img);
+    if (r != VK_SUCCESS) {
+        vk.DestroySwapchainKHR(V.dev, P.swapchain, NULL);
+        P.swapchain = VK_NULL_HANDLE;
+        P.nimg = 0;
+        return p_off("the swapchain has more than %d images (VkResult %d)",
+                     NVK_PRESENT_MAX_IMAGES, (int)r);
+    }
+    memset(&si, 0, sizeof si);
+    si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    for (i = 0; i < P.nimg; i++)
+        if (vk.CreateSemaphore(V.dev, &si, NULL, &P.done[i]) != VK_SUCCESS) {
+            p_swapchain_destroy();
+            return p_off("vkCreateSemaphore failed");
+        }
+    P.need_swapchain = 0;
+    P.swapchains++;
+    snprintf(P.status, sizeof P.status,
+             "swapchain %ux%u %s, %u images, %s, %s %s%s%s",
+             P.extent.width, P.extent.height, p_fmt_name(P.format), P.nimg,
+             P.mode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO (vsync)"
+             : P.mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "immediate",
+             P.aspect == 0 ? "stretched" : P.aspect < 0 ? "frame aspect" : "letterboxed",
+             P.linear ? "linear" : "nearest",
+             P.transform == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR ? ", pre-rotated a half turn"
+             : caps.currentTransform != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR ? ", rotated by the compositor" : "",
+             P.alpha == VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR ? "" : ", alpha forced opaque");
+    return 1;
+}
+
+/* The presenter's own objects, once the device is up. Never fails the
+ * renderer: on any problem the presenter is off and the window falls back. */
+static void p_setup(void)
+{
+    VkCommandPoolCreateInfo cp;
+    VkCommandBufferAllocateInfo ca;
+    VkFenceCreateInfo fi;
+    VkSemaphoreCreateInfo si;
+    int i;
+
+    if (!P.surface) {
+        if (!P.status[0])
+            p_off("no surface");
+        return;
+    }
+    if (!P.can_present) {
+        p_off("the chosen device's graphics queue cannot present to the window");
+        return;
+    }
+    if (!P.have_swapchain_ext) {
+        p_off("the device has no VK_KHR_swapchain");
+        return;
+    }
+    memset(&cp, 0, sizeof cp);
+    cp.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cp.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    cp.queueFamilyIndex = V.qfam;
+    memset(&ca, 0, sizeof ca);
+    ca.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ca.commandBufferCount = 2;
+    memset(&fi, 0, sizeof fi);
+    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    memset(&si, 0, sizeof si);
+    si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    if (vk.CreateCommandPool(V.dev, &cp, NULL, &P.pool) != VK_SUCCESS) {
+        p_off("vkCreateCommandPool failed");
+        return;
+    }
+    ca.commandPool = P.pool;
+    if (vk.AllocateCommandBuffers(V.dev, &ca, P.cmd) != VK_SUCCESS) {
+        p_off("vkAllocateCommandBuffers failed");
+        return;
+    }
+    for (i = 0; i < 2; i++)
+        if (vk.CreateFence(V.dev, &fi, NULL, &P.fence[i]) != VK_SUCCESS
+            || vk.CreateSemaphore(V.dev, &si, NULL, &P.acq[i]) != VK_SUCCESS) {
+            p_off("vkCreateFence/vkCreateSemaphore failed");
+            return;
+        }
+    P.ok = 1;
+    if (p_swapchain_create() < 0)
+        return;
+    if (!P.swapchain)
+        snprintf(P.status, sizeof P.status, "waiting for the window (no swapchain yet)");
+}
+
+/* Every presenter object, and the surface. The renderer stays up. */
+static void p_teardown(void)
+{
+    int i;
+
+    if (V.dev) {
+        if (P.pool || P.swapchain)
+            dev_idle();
+        p_wait_slots();
+        p_swapchain_destroy();
+        for (i = 0; i < 2; i++) {
+            if (P.fence[i]) vk.DestroyFence(V.dev, P.fence[i], NULL);
+            if (P.acq[i]) vk.DestroySemaphore(V.dev, P.acq[i], NULL);
+            p_buf_free(&P.staging[i]);
+            p_img_free(&P.src[i]);
+        }
+        p_buf_free(&P.cap);
+        if (P.pool)
+            vk.DestroyCommandPool(V.dev, P.pool, NULL);
+    }
+    p_surface_destroy();
+    memset(&P, 0, sizeof P);
+}
+
+static void p_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
+                      VkAccessFlags sa, VkAccessFlags da,
+                      VkPipelineStageFlags ss, VkPipelineStageFlags ds)
+{
+    VkImageMemoryBarrier b;
+    memset(&b, 0, sizeof b);
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcAccessMask = sa;
+    b.dstAccessMask = da;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.layerCount = 1;
+    vk.CmdPipelineBarrier(cb, ss, ds, 0, 0, NULL, 0, NULL, 1, &b);
+}
+
+/* Where a w x h frame goes in the window: centred at the display aspect. */
+static void p_dst_rect(uint32_t w, uint32_t h, VkOffset3D o[2])
+{
+    double ew = P.extent.width, eh = P.extent.height, a = P.aspect, dw, dh;
+    int x0, y0;
+
+    memset(o, 0, 2 * sizeof *o);
+    o[1].z = 1;
+    if (a < 0)
+        a = (double)w / (double)h;
+    if (a == 0) {
+        o[1].x = (int32_t)P.extent.width;
+        o[1].y = (int32_t)P.extent.height;
+        return;
+    }
+    if (ew / eh > a) {
+        dh = eh;
+        dw = eh * a;
+    } else {
+        dw = ew;
+        dh = ew / a;
+    }
+    x0 = (int)((ew - dw) / 2.0 + 0.5);
+    y0 = (int)((eh - dh) / 2.0 + 0.5);
+    o[0].x = x0;
+    o[0].y = y0;
+    o[1].x = x0 + (int)(dw + 0.5);
+    o[1].y = y0 + (int)(dh + 0.5);
+    if (o[1].x > (int32_t)P.extent.width) o[1].x = (int32_t)P.extent.width;
+    if (o[1].y > (int32_t)P.extent.height) o[1].y = (int32_t)P.extent.height;
+}
+
+static int p_fail(const char *what, VkResult r)
+{
+    if (r == VK_ERROR_DEVICE_LOST)
+        return p_off("%s: the device was lost", what);
+    return p_off("%s failed (VkResult %d)", what, (int)r);
+}
+
+/* One frame: `px` (w x h, `pitch` bytes a row, bpp 2 = R5G6B5, 4 = X8R8G8B8)
+ * or, with px NULL, the last frame again. Records and submits on this
+ * thread's slot; waits only for the slot used two frames ago, so the CPU
+ * prepares a frame while the GPU shows the previous one. */
+static int p_present(const void *px, uint32_t w, uint32_t h, uint32_t pitch, uint32_t bpp)
+{
+    VkCommandBufferBeginInfo bi;
+    VkSubmitInfo si;
+    VkPresentInfoKHR pi;
+    VkImageBlit blit;
+    VkClearColorValue black;
+    VkImageSubresourceRange range;
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkCommandBuffer cb;
+    NvkPImg *src;
+    VkResult r;
+    uint32_t img, slot, y;
+    VkFormat sf;
+    int reuse = !px;
+
+    if (!P.ok)
+        return -1;
+    if (P.suspended)
+        return 1;
+    if (!P.surface) {
+        if (p_surface_create_q(1) < 0) {
+            if (!P.ok)
+                return -1;                  /* the window cannot be presented to */
+            P.skipped++;
+            return 1;                       /* no window yet: the next frame tries again */
+        }
+        P.need_swapchain = 1;
+    }
+    if (!P.swapchain || P.need_swapchain) {
+        int c;
+        p_swapchain_destroy();
+        c = p_swapchain_create();
+        if (c < 0)
+            return -1;
+        if (c == 0)
+            return 1;
+    }
+    if (reuse) {
+        if (P.cap_slot < 0 || !P.src[P.cap_slot].img)
+            return 1;                       /* nothing shown yet */
+        slot = (uint32_t)P.cap_slot;
+        w = P.src[slot].w;
+        h = P.src[slot].h;
+    } else {
+        if (!w || !h || w > NVK_MAX_DIM || h > NVK_MAX_DIM || (bpp != 2 && bpp != 4)
+            || pitch < w * bpp)
+            return 1;
+        slot = P.cap_slot < 0 ? 0 : (uint32_t)(P.cap_slot ^ 1);
+    }
+    if (P.pending[slot]) {
+        r = vk.WaitForFences(V.dev, 1, &P.fence[slot], VK_TRUE, UINT64_MAX);
+        if (r != VK_SUCCESS)
+            return p_fail("vkWaitForFences", r);
+        vk.ResetFences(V.dev, 1, &P.fence[slot]);
+        P.pending[slot] = 0;
+    }
+    src = &P.src[slot];
+    if (!reuse) {
+        VkDeviceSize need = (VkDeviceSize)w * h * bpp;
+        sf = bpp == 4 ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R5G6B5_UNORM_PACK16;
+        if (bpp == 2) {
+            VkFormatProperties fp;
+            vk.GetPhysicalDeviceFormatProperties(V.phys, sf, &fp);
+            if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) {
+                sf = VK_FORMAT_B8G8R8A8_UNORM;     /* widened on the CPU below */
+                need = (VkDeviceSize)w * h * 4;
+            }
+        }
+        if (P.staging[slot].size < need) {
+            p_buf_free(&P.staging[slot]);
+            if (!p_buf(&P.staging[slot], need, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0))
+                return p_off("no memory for a %ux%u frame", w, h);
+        }
+        if (!src->img || src->w != w || src->h != h || src->fmt != sf) {
+            p_img_free(src);
+            if (!p_img(src, w, h, sf))
+                return p_off("cannot make a %ux%u frame image", w, h);
+        }
+        /* Rows into the staging buffer; X8R8G8B8 gets an opaque alpha so the
+         * window's alpha mode never matters. */
+        for (y = 0; y < h; y++) {
+            const uint8_t *s = (const uint8_t *)px + (size_t)y * pitch;
+            if (sf == VK_FORMAT_B8G8R8A8_UNORM && bpp == 4) {
+                uint32_t *d = (uint32_t *)P.staging[slot].map + (size_t)y * w, x;
+                memcpy(d, s, (size_t)w * 4);
+                for (x = 0; x < w; x++)
+                    d[x] |= 0xFF000000u;
+            } else if (sf == VK_FORMAT_B8G8R8A8_UNORM) {
+                uint32_t *d = (uint32_t *)P.staging[slot].map + (size_t)y * w, x;
+                for (x = 0; x < w; x++) {
+                    uint32_t v = (uint32_t)s[2 * x] | ((uint32_t)s[2 * x + 1] << 8);
+                    uint32_t r5 = (v >> 11) & 31, g6 = (v >> 5) & 63, b5 = v & 31;
+                    d[x] = 0xFF000000u | (((r5 << 3) | (r5 >> 2)) << 16)
+                         | (((g6 << 2) | (g6 >> 4)) << 8) | ((b5 << 3) | (b5 >> 2));
+                }
+            } else {
+                memcpy((uint8_t *)P.staging[slot].map + (size_t)y * w * 2, s, (size_t)w * 2);
+            }
+        }
+    }
+
+    r = vk.AcquireNextImageKHR(V.dev, P.swapchain, 100000000ull /* 100 ms */, P.acq[slot],
+                               VK_NULL_HANDLE, &img);
+    if (r == VK_TIMEOUT || r == VK_NOT_READY) {
+        P.skipped++;
+        return 1;
+    }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+        P.need_swapchain = 1;
+        P.skipped++;
+        return 1;
+    }
+    if (r == VK_ERROR_SURFACE_LOST_KHR) {
+        p_surface_destroy();
+        P.skipped++;
+        return 1;
+    }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
+        return p_fail("vkAcquireNextImageKHR", r);
+
+    cb = P.cmd[slot];
+    vk.ResetCommandBuffer(cb, 0);
+    memset(&bi, 0, sizeof bi);
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if ((r = vk.BeginCommandBuffer(cb, &bi)) != VK_SUCCESS)
+        return p_fail("vkBeginCommandBuffer", r);
+    if (!reuse) {
+        VkBufferImageCopy c;
+        p_barrier(cb, src->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        memset(&c, 0, sizeof c);
+        c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        c.imageSubresource.layerCount = 1;
+        c.imageExtent.width = w;
+        c.imageExtent.height = h;
+        c.imageExtent.depth = 1;
+        vk.CmdCopyBufferToImage(cb, P.staging[slot].buf, src->img,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        p_barrier(cb, src->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    }
+    /* The window image: black bars, then the frame scaled into place. */
+    p_barrier(cb, P.img[img], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+              0, VK_ACCESS_TRANSFER_WRITE_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    memset(&black, 0, sizeof black);
+    black.float32[3] = 1.0f;
+    memset(&range, 0, sizeof range);
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.levelCount = 1;
+    range.layerCount = 1;
+    vk.CmdClearColorImage(cb, P.img[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+    p_barrier(cb, P.img[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+              VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    memset(&blit, 0, sizeof blit);
+    blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.srcSubresource.layerCount = 1;
+    blit.srcOffsets[1].x = (int32_t)w;
+    blit.srcOffsets[1].y = (int32_t)h;
+    blit.srcOffsets[1].z = 1;
+    blit.dstSubresource = blit.srcSubresource;
+    p_dst_rect(w, h, blit.dstOffsets);
+    if (P.transform == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) {
+        /* Pre-rotated by half a turn: a blit with both axes reversed. */
+        int32_t t;
+        t = blit.dstOffsets[0].x;
+        blit.dstOffsets[0].x = (int32_t)P.extent.width - blit.dstOffsets[1].x;
+        blit.dstOffsets[1].x = (int32_t)P.extent.width - t;
+        t = blit.dstOffsets[0].y;
+        blit.dstOffsets[0].y = (int32_t)P.extent.height - blit.dstOffsets[1].y;
+        blit.dstOffsets[1].y = (int32_t)P.extent.height - t;
+        t = blit.dstOffsets[0].x; blit.dstOffsets[0].x = blit.dstOffsets[1].x; blit.dstOffsets[1].x = t;
+        t = blit.dstOffsets[0].y; blit.dstOffsets[0].y = blit.dstOffsets[1].y; blit.dstOffsets[1].y = t;
+    }
+    vk.CmdBlitImage(cb, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    P.img[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                    P.linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    if (P.capture && (P.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        VkBufferImageCopy c;
+        VkDeviceSize need = (VkDeviceSize)P.extent.width * P.extent.height * 4;
+        if (P.cap.size < need) {
+            p_buf_free(&P.cap);
+            if (!p_buf(&P.cap, need, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1))
+                P.capture = 0;
+        }
+        if (P.capture) {
+            p_barrier(cb, P.img[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            memset(&c, 0, sizeof c);
+            c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            c.imageSubresource.layerCount = 1;
+            c.imageExtent.width = P.extent.width;
+            c.imageExtent.height = P.extent.height;
+            c.imageExtent.depth = 1;
+            vk.CmdCopyImageToBuffer(cb, P.img[img], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    P.cap.buf, 1, &c);
+            p_barrier(cb, P.img[img], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                      VK_ACCESS_TRANSFER_READ_BIT, 0,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            P.cap_w = P.extent.width;
+            P.cap_h = P.extent.height;
+        }
+    }
+    if (!(P.capture && (P.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)))
+        p_barrier(cb, P.img[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                  VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    if ((r = vk.EndCommandBuffer(cb)) != VK_SUCCESS)
+        return p_fail("vkEndCommandBuffer", r);
+
+    memset(&si, 0, sizeof si);
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.waitSemaphoreCount = 1;
+    si.pWaitSemaphores = &P.acq[slot];
+    si.pWaitDstStageMask = &wait_stage;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &P.done[img];
+    memset(&pi, 0, sizeof pi);
+    pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &P.done[img];
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &P.swapchain;
+    pi.pImageIndices = &img;
+    pthread_mutex_lock(&s_qlock);
+    r = vk.QueueSubmit(V.queue, 1, &si, P.fence[slot]);
+    if (r == VK_SUCCESS) {
+        VkResult pr = vk.QueuePresentKHR(V.queue, &pi);
+        pthread_mutex_unlock(&s_qlock);
+        P.pending[slot] = 1;
+        P.cap_slot = (int)slot;
+        P.cap_valid = P.capture && (P.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        P.presents++;
+        P.frame++;
+        if (pr == VK_ERROR_OUT_OF_DATE_KHR) {
+            P.need_swapchain = 1;
+        } else if (pr == VK_SUBOPTIMAL_KHR) {
+            /* Android reports a rotated display as suboptimal on every
+             * present when the frames are not pre-rotated (the compositor
+             * rotates them): rebuild only when the size changed. */
+            VkSurfaceCapabilitiesKHR caps;
+            if (vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(V.phys, P.surface, &caps) == VK_SUCCESS
+                && caps.currentExtent.width != 0xFFFFFFFFu
+                && (caps.currentExtent.width != P.extent.width
+                    || caps.currentExtent.height != P.extent.height))
+                P.need_swapchain = 1;
+        } else if (pr == VK_ERROR_SURFACE_LOST_KHR) {
+            p_surface_destroy();
+        } else if (pr != VK_SUCCESS) {
+            return p_fail("vkQueuePresentKHR", pr);
+        }
+        return 0;
+    }
+    pthread_mutex_unlock(&s_qlock);
+    return p_fail("vkQueueSubmit (present)", r);
+}
+
 static int off(const char *fmt, ...)
 {
     va_list ap;
@@ -2226,11 +3127,12 @@ static int create_instance(void)
 {
     VkApplicationInfo app;
     VkInstanceCreateInfo ci;
-    const char *exts[2], *layers[1];
-    uint32_t next = 0, nlay = 0, n = 0;
+    const char *exts[2 + 8], *layers[1];
+    uint32_t next = 0, nlay = 0, n = 0, i;
     VkExtensionProperties *e = NULL;
     VkResult r;
     const char *val = getenv("RECOMP_VK_VALIDATION");
+    int surface_exts = 0;
 
     memset(&app, 0, sizeof app);
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -2242,12 +3144,31 @@ static int create_instance(void)
     ci.pApplicationInfo = &app;
     if (vk.EnumerateInstanceExtensionProperties(NULL, &n, NULL) == VK_SUCCESS && n) {
         e = (VkExtensionProperties *)calloc(n, sizeof *e);
-        if (e && vk.EnumerateInstanceExtensionProperties(NULL, &n, e) == VK_SUCCESS
-            && has_ext(e, n, "VK_KHR_portability_enumeration")) {
-            exts[next++] = "VK_KHR_portability_enumeration";
-            ci.flags |= 0x00000001;   /* VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR */
+        if (e && vk.EnumerateInstanceExtensionProperties(NULL, &n, e) == VK_SUCCESS) {
+            if (has_ext(e, n, "VK_KHR_portability_enumeration")) {
+                exts[next++] = "VK_KHR_portability_enumeration";
+                ci.flags |= 0x00000001;   /* VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR */
+            }
+            /* The window's surface extensions (VK_KHR_surface and the
+             * platform's, e.g. VK_KHR_android_surface): all or none, each
+             * tested first, so a missing one costs the presenter only. */
+            if (P.wanted) {
+                const char *missing = NULL;
+                for (i = 0; i < P.next && !missing; i++)
+                    if (!has_ext(e, n, P.exts[i]))
+                        missing = P.exts[i];
+                if (missing) {
+                    p_off("the Vulkan instance has no %s", missing);
+                } else {
+                    for (i = 0; i < P.next; i++)
+                        exts[next++] = P.exts[i];
+                    surface_exts = 1;
+                }
+            }
         }
         free(e);
+    } else if (P.wanted) {
+        p_off("the Vulkan instance reports no extensions");
     }
     if (val && strcmp(val, "0") && vk.EnumerateInstanceLayerProperties) {
         uint32_t ln = 0, i;
@@ -2273,6 +3194,17 @@ static int create_instance(void)
     if (!vk.n) return off("vk" #n " missing");
     NVK_INSTANCE_FNS(NVK_IFN)
 #undef NVK_IFN
+    if (surface_exts) {
+        int all = 1;
+#define NVK_SFN(n) vk.n = (PFN_vk##n)vk.GetInstanceProcAddr(V.inst, "vk" #n); \
+        if (!vk.n) all = 0;
+        NVK_SURFACE_FNS(NVK_SFN)
+#undef NVK_SFN
+        if (all)
+            P.have_surface_ext = 1;
+        else
+            p_off("the Vulkan loader lacks the VK_KHR_surface entry points");
+    }
     return 0;
 }
 
@@ -2303,6 +3235,16 @@ static int device_usable(VkPhysicalDevice pd, uint32_t *qf)
                        VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT));
 }
 
+/* Whether `pd`'s graphics queue family can present to the window. */
+static int can_present(VkPhysicalDevice pd)
+{
+    uint32_t qf;
+    VkBool32 sup = VK_FALSE;
+    if (!P.surface || !queue_family(pd, &qf))
+        return 0;
+    return vk.GetPhysicalDeviceSurfaceSupportKHR(pd, qf, P.surface, &sup) == VK_SUCCESS && sup;
+}
+
 static int pick_device(void)
 {
     VkPhysicalDevice pds[16];
@@ -2330,6 +3272,10 @@ static int pick_device(void)
             score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
                  || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
                   : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? 2 : 1;
+            /* A window to show frames in: one GPU does both, and frames
+             * never cross devices. */
+            if (can_present(pds[i]))
+                score += 4;
             if (score > best_score) {
                 best = (int)i;
                 best_score = score;
@@ -2341,6 +3287,7 @@ static int pick_device(void)
     }
     V.phys = pds[best];
     queue_family(V.phys, &V.qfam);
+    P.can_present = can_present(V.phys);
     return 0;
 }
 
@@ -2350,11 +3297,11 @@ static int create_device(char *feat, size_t featn)
     VkDeviceCreateInfo ci;
     VkPhysicalDeviceFeatures have, want;
     VkExtensionProperties *e = NULL;
-    const char *exts[1];
+    const char *exts[2];
     uint32_t n = 0, next = 0;
     float prio = 1.0f;
     VkResult r;
-    int portability = 0;
+    int portability = 0, swapchain = 0;
 
     vk.GetPhysicalDeviceFeatures(V.phys, &have);
     memset(&want, 0, sizeof want);
@@ -2363,10 +3310,16 @@ static int create_device(char *feat, size_t featn)
     V.depth_clamp = have.depthClamp ? 1 : 0;
     if (vk.EnumerateDeviceExtensionProperties(V.phys, NULL, &n, NULL) == VK_SUCCESS && n) {
         e = (VkExtensionProperties *)calloc(n, sizeof *e);
-        if (e && vk.EnumerateDeviceExtensionProperties(V.phys, NULL, &n, e) == VK_SUCCESS
-            && has_ext(e, n, "VK_KHR_portability_subset")) {
-            exts[next++] = "VK_KHR_portability_subset";   /* required when offered */
-            portability = 1;
+        if (e && vk.EnumerateDeviceExtensionProperties(V.phys, NULL, &n, e) == VK_SUCCESS) {
+            if (has_ext(e, n, "VK_KHR_portability_subset")) {
+                exts[next++] = "VK_KHR_portability_subset";   /* required when offered */
+                portability = 1;
+            }
+            /* Only with a window that this device's queue can present to. */
+            if (P.surface && P.can_present && has_ext(e, n, "VK_KHR_swapchain")) {
+                exts[next++] = "VK_KHR_swapchain";
+                swapchain = 1;
+            }
         }
         free(e);
     }
@@ -2389,6 +3342,14 @@ static int create_device(char *feat, size_t featn)
     if (!vk.n) return off("vk" #n " missing");
     NVK_DEVICE_FNS(NVK_DFN)
 #undef NVK_DFN
+    if (swapchain) {
+        int all = 1;
+#define NVK_SCFN(n) vk.n = (PFN_vk##n)vk.GetDeviceProcAddr(V.dev, "vk" #n); \
+        if (!vk.n) all = 0;
+        NVK_SWAPCHAIN_FNS(NVK_SCFN)
+#undef NVK_SCFN
+        P.have_swapchain_ext = all;
+    }
     vk.GetDeviceQueue(V.dev, V.qfam, 0, &V.queue);
     snprintf(feat, featn, "depthClamp %s%s", V.depth_clamp ? "yes" : "no",
              portability ? ", portability subset" : "");
@@ -2641,15 +3602,30 @@ static void read_env(void)
     }
 }
 
-static int nvk_init(void)
+/* The instance, the window's surface (when a presenter asked for one) and
+ * the device: what the renderer and the presenter share. Idempotent. */
+static int nvk_device_up(void)
 {
     VkPhysicalDeviceProperties p;
-    char feat[96];
 
+    if (V.dev)
+        return 0;
+    if (V.inst || V.lib) {
+        /* A failed attempt left the instance or the loader: start over. */
+        p_surface_destroy();
+        if (V.inst && vk.DestroyInstance)
+            vk.DestroyInstance(V.inst, NULL);
+        if (V.lib)
+            dlclose(V.lib);
+    }
     memset(&V, 0, sizeof V);
     V.init_tried = 1;
     read_env();
-    if (load_loader() || create_instance() || pick_device())
+    if (load_loader() || create_instance())
+        return -1;
+    if (P.wanted && P.have_surface_ext && !P.surface)
+        p_surface_create();                 /* failure: the presenter is off */
+    if (pick_device())
         return -1;
     vk.GetPhysicalDeviceProperties(V.phys, &p);
     vk.GetPhysicalDeviceMemoryProperties(V.phys, &V.mem);
@@ -2659,22 +3635,49 @@ static int nvk_init(void)
     V.depth_fmt = fmt_has(V.phys, VK_FORMAT_D24_UNORM_S8_UINT,
                           VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
                 ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
-    if (create_device(feat, sizeof feat))
+    if (create_device(V.feat, sizeof V.feat))
         return -1;
+    snprintf(V.devdesc, sizeof V.devdesc, "Vulkan %u.%u.%u on %s (%s, driver 0x%08X, vendor 0x%04X)",
+             VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion),
+             VK_VERSION_PATCH(p.apiVersion), p.deviceName, dev_type(p.deviceType),
+             p.driverVersion, p.vendorID);
+    return 0;
+}
+
+/* The renderer's objects on top of the device. */
+static int nvk_renderer_up(void)
+{
+    V.renderer_tried = 1;
     V.ok = 1;
     if (!create_objects()) {
         V.ok = 0;
         return -1;                          /* nvk_fail wrote the status */
     }
-    snprintf(V.status, sizeof V.status,
-             "Vulkan %u.%u.%u on %s (%s, driver 0x%08X, vendor 0x%04X), depth %s, %s,"
-             " pipeline cache %s",
-             VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion),
-             VK_VERSION_PATCH(p.apiVersion), p.deviceName, dev_type(p.deviceType),
-             p.driverVersion, p.vendorID,
-             V.depth_fmt == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8", feat, V.pc_state);
+    snprintf(V.status, sizeof V.status, "%s, depth %s, %s, pipeline cache %s", V.devdesc,
+             V.depth_fmt == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8", V.feat, V.pc_state);
     nvk_log("%s", V.status);
     return 0;
+}
+
+/* The device and the presenter are gone together, by whichever of the
+ * renderer and the presenter shuts down last (s_life). */
+static pthread_mutex_t s_life = PTHREAD_MUTEX_INITIALIZER;
+static int s_renderer_down = 1, s_presenter_down = 1;
+
+static void nvk_device_down(void)
+{
+    if (V.dev) {
+        dev_idle();
+        vk.DestroyDevice(V.dev, NULL);
+    }
+    p_surface_destroy();
+    if (V.inst && vk.DestroyInstance)
+        vk.DestroyInstance(V.inst, NULL);
+    if (V.lib)
+        dlclose(V.lib);
+    V.dev = VK_NULL_HANDLE;
+    V.inst = VK_NULL_HANDLE;
+    V.lib = NULL;
 }
 
 /* ---- API ---------------------------------------------------------------------- */
@@ -2682,9 +3685,18 @@ static int nvk_init(void)
 int nv2a_vk_register(void)
 {
     if (!V.ok) {
-        if (V.init_tried && V.dev)
+        int rc;
+        if (V.renderer_tried && V.dev)
             return -1;                      /* failed mid-run: stay on the CPU */
-        if (nvk_init() != 0) {
+        pthread_mutex_lock(&s_life);
+        rc = nvk_device_up();
+        if (rc == 0) {
+            rc = nvk_renderer_up();
+            if (rc == 0)
+                s_renderer_down = 0;
+        }
+        pthread_mutex_unlock(&s_life);
+        if (rc != 0) {
             nvk_log("%s", V.status);
             return -1;
         }
@@ -2724,7 +3736,7 @@ void nv2a_vk_shutdown(void)
             if (V.pc_dirty)
                 pc_save("shutdown");
         }
-        vk.DeviceWaitIdle(V.dev);
+        dev_idle();
         V.recording = 0;
         for (i = 0; i < V.dead_img_n; i++)
             img_destroy_now(&V.dead_img[i]);
@@ -2762,15 +3774,206 @@ void nv2a_vk_shutdown(void)
         if (V.rp) vk.DestroyRenderPass(V.dev, V.rp, NULL);
         if (V.fence) vk.DestroyFence(V.dev, V.fence, NULL);
         if (V.cpool) vk.DestroyCommandPool(V.dev, V.cpool, NULL);
-        vk.DestroyDevice(V.dev, NULL);
     }
-    if (V.inst && vk.DestroyInstance)
-        vk.DestroyInstance(V.inst, NULL);
     free(V.pipes);
     free(V.dead_img);
     free(V.dead_fb);
-    if (V.lib)
-        dlclose(V.lib);
-    memset(&V, 0, sizeof V);
+    pthread_mutex_lock(&s_life);
+    s_renderer_down = 1;
+    if (s_presenter_down) {
+        nvk_device_down();
+        memset(&V, 0, sizeof V);
+    } else {
+        /* The window still presents on this device: only the renderer's
+         * objects go (create_objects can bring them back). */
+        VkInstance inst = V.inst;
+        VkPhysicalDevice phys = V.phys;
+        VkDevice dev = V.dev;
+        VkQueue queue = V.queue;
+        uint32_t qfam = V.qfam;
+        VkPhysicalDeviceMemoryProperties mem = V.mem;
+        void *lib = V.lib;
+        char devdesc[sizeof V.devdesc], feat[sizeof V.feat];
+        VkDeviceSize ubo_align = V.ubo_align;
+        VkFormat depth_fmt = V.depth_fmt;
+        int depth_clamp = V.depth_clamp;
+        memcpy(devdesc, V.devdesc, sizeof devdesc);
+        memcpy(feat, V.feat, sizeof feat);
+        memset(&V, 0, sizeof V);
+        V.inst = inst; V.phys = phys; V.dev = dev; V.queue = queue; V.qfam = qfam;
+        V.mem = mem; V.lib = lib; V.ubo_align = ubo_align; V.depth_fmt = depth_fmt;
+        V.depth_clamp = depth_clamp; V.init_tried = 1;
+        memcpy(V.devdesc, devdesc, sizeof devdesc);
+        memcpy(V.feat, feat, sizeof feat);
+        read_env();
+    }
+    pthread_mutex_unlock(&s_life);
     snprintf(V.status, sizeof V.status, "off: shut down");
+}
+
+/* ---- window presentation API (nv2a_vk.h) ------------------------------------ */
+
+int nv2a_vk_present_init(const char *const *instance_exts, unsigned n_exts,
+                         Nv2aVkSurfaceFn create_surface, void *ctx,
+                         unsigned width, unsigned height)
+{
+    unsigned i;
+    const char *e;
+    char keep[sizeof P.status];
+
+    if (P.ok)
+        return 0;
+    memset(&P, 0, sizeof P);
+    P.cap_slot = -1;
+    p_read_env();
+    e = getenv("RECOMP_PRESENT_CAPTURE");
+    P.capture = e && strcmp(e, "0") != 0;
+    if (!create_surface || n_exts > sizeof P.exts / sizeof P.exts[0])
+        return p_off("bad arguments");
+    for (i = 0; i < n_exts; i++)
+        P.exts[i] = instance_exts[i];
+    P.next = n_exts;
+    P.create_surface = create_surface;
+    P.ctx = ctx;
+    P.want_w = width ? width : 640;
+    P.want_h = height ? height : 480;
+    pthread_mutex_lock(&s_life);
+    if (V.dev) {
+        pthread_mutex_unlock(&s_life);
+        return p_off("the Vulkan device is already up, without the window's extensions"
+                     " (nv2a_vk_present_init must come first)");
+    }
+    P.wanted = 1;
+    if (nvk_device_up() != 0) {
+        if (!P.status[0] || P.ok)
+            p_off("%s", V.status[0] ? V.status : "no Vulkan device");
+        else if (strncmp(V.status, "off: ", 5) == 0) {
+            /* Both reasons: the device's, then the presenter's. */
+            snprintf(keep, sizeof keep, "%s", P.status);
+            snprintf(P.status, sizeof P.status, "%.180s (%.180s)", keep, V.status + 5);
+        }
+        P.wanted = 0;
+        P.ok = 0;
+        pthread_mutex_unlock(&s_life);
+        return -1;
+    }
+    s_presenter_down = 0;
+    p_setup();
+    if (!P.ok) {
+        snprintf(keep, sizeof keep, "%s", P.status);
+        p_teardown();                       /* the device stays, for the renderer */
+        memcpy(P.status, keep, sizeof keep);
+        s_presenter_down = 1;
+        pthread_mutex_unlock(&s_life);
+        return -1;
+    }
+    pthread_mutex_unlock(&s_life);
+    nvk_log("presenter on %s: %s", V.devdesc, P.status);
+    return 0;
+}
+
+const char *nv2a_vk_present_status(void)
+{
+    return P.status[0] ? P.status : "off: not requested";
+}
+
+int nv2a_vk_present_frame(const void *pixels, unsigned width, unsigned height,
+                          unsigned pitch, unsigned bpp)
+{
+    int r;
+    if (!P.ok)
+        return -1;
+    r = p_present(pixels, width, height, pitch, bpp);
+    if (r < 0) {
+        /* Off for good: release the window now, so whatever presents next
+         * can connect to it. */
+        char keep[sizeof P.status];
+        snprintf(keep, sizeof keep, "%s", P.status);
+        pthread_mutex_lock(&s_life);
+        p_teardown();
+        s_presenter_down = 1;
+        pthread_mutex_unlock(&s_life);
+        memcpy(P.status, keep, sizeof keep);
+    }
+    return r;
+}
+
+void nv2a_vk_present_resize(unsigned width, unsigned height)
+{
+    if (!P.ok)
+        return;
+    if (width && height) {
+        P.want_w = width;
+        P.want_h = height;
+    }
+    P.need_swapchain = 1;
+}
+
+void nv2a_vk_present_suspend(void)
+{
+    if (!P.ok || P.suspended)
+        return;
+    p_surface_destroy();
+    P.suspended = 1;
+    P.suspends++;
+}
+
+void nv2a_vk_present_resume(void)
+{
+    if (!P.ok)
+        return;
+    P.suspended = 0;
+    P.need_swapchain = 1;                  /* the surface comes back on the next frame */
+}
+
+void nv2a_vk_present_get_stats(Nv2aVkPresentStats *out)
+{
+    memset(out, 0, sizeof *out);
+    out->presents = P.presents;
+    out->skipped = P.skipped;
+    out->swapchains = P.swapchains;
+    out->suspends = P.suspends;
+    out->width = P.extent.width;
+    out->height = P.extent.height;
+    out->active = P.ok && P.swapchain != VK_NULL_HANDLE;
+}
+
+int nv2a_vk_present_capture(uint8_t *rgba, unsigned max_bytes, unsigned *width, unsigned *height)
+{
+    uint32_t i, n;
+    const uint8_t *src;
+    int swap;
+
+    if (!P.ok || !P.cap_valid || !P.cap.map)
+        return -1;
+    p_wait_slots();
+    n = P.cap_w * P.cap_h;
+    if ((uint64_t)n * 4 > max_bytes)
+        return -1;
+    src = (const uint8_t *)P.cap.map;
+    swap = P.format == VK_FORMAT_B8G8R8A8_UNORM || P.format == VK_FORMAT_B8G8R8A8_SRGB;
+    for (i = 0; i < n; i++) {
+        rgba[4 * i + 0] = src[4 * i + (swap ? 2 : 0)];
+        rgba[4 * i + 1] = src[4 * i + 1];
+        rgba[4 * i + 2] = src[4 * i + (swap ? 0 : 2)];
+        rgba[4 * i + 3] = src[4 * i + 3];
+    }
+    *width = P.cap_w;
+    *height = P.cap_h;
+    return 0;
+}
+
+void nv2a_vk_present_shutdown(void)
+{
+    pthread_mutex_lock(&s_life);
+    if (!s_presenter_down) {
+        p_teardown();
+        s_presenter_down = 1;
+        if (s_renderer_down) {
+            nvk_device_down();
+            memset(&V, 0, sizeof V);
+        }
+    }
+    pthread_mutex_unlock(&s_life);
+    snprintf(P.status, sizeof P.status, "off: shut down");
 }

@@ -120,7 +120,7 @@ def _host_summary(r):
         return None
     keep = ("platform", "entry_reached", "title_returned", "exit", "seconds", "flips",
             "display_changes", "display_set", "selftest", "display_bmp", "log", "failed_step", "note",
-            "render")
+            "render", "present")
     out = {k: r.get(k) for k in keep if k in r}
     out["crash"] = r.get("crash", [])[:20]
     out["unimpl_reached"] = r.get("unimpl", [])[:20]
@@ -205,6 +205,20 @@ def to_markdown(r):
             # (and why). A booted title on the CPU rasteriser is still booted.
             out.append("- renderer: %s (%s)" % (rt["render"].get("backend"),
                                                 rt["render"].get("detail")))
+        if rt.get("present"):
+            # What put the frames on the screen: the Vulkan swapchain
+            # presenter, or the SDL renderer (and why).
+            out.append("- presenter: %s (%s)" % (rt["present"].get("backend"),
+                                                 rt["present"].get("detail")))
+        for key, label in (("screen_check", "screen"),
+                           ("screen_after_resume", "screen after background/foreground")):
+            sc = rt.get(key)
+            if sc:
+                out.append("- %s: %s -- %s" % (label, "matches" if sc.get("ok") else "NO MATCH",
+                                               sc.get("reason")))
+        if rt.get("lifecycle_test"):
+            lt = rt["lifecycle_test"]
+            out.append("- background/foreground: %s" % lt.get("verdict"))
         for line in rt.get("crash", [])[:12]:
             out.append("    %s" % line)
         for line in rt.get("title_lines", [])[:40]:

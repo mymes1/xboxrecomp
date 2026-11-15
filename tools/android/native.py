@@ -219,7 +219,8 @@ _STATUS = re.compile(r"^\[STATUS\] t=(\d+)s flips=(\d+) draws=(\d+) display=0x([
 def parse_boot_log(text):
     """The [BOOT]/[STATUS]/[CRASH] protocol of src/host, from any host's log."""
     out = {"boot": [], "entry_reached": False, "title_returned": False, "crash": [],
-           "unimpl": [], "icall": [], "status": [], "title_lines": [], "failed_step": None}
+           "unimpl": [], "icall": [], "status": [], "title_lines": [], "failed_step": None,
+           "lifecycle": []}
     for raw in text.splitlines():
         line = raw.rstrip()
         # logcat prefixes ("I xboxrecomp: ") are stripped by the caller.
@@ -234,6 +235,13 @@ def parse_boot_log(text):
                 rest = msg[len("render: "):]
                 name, _, why = rest.partition(" ")
                 out["render"] = {"backend": name, "detail": why.strip().strip("()")}
+            elif msg.startswith("present: "):
+                # "present: vulkan (<swapchain>)" or "present: sdl (<why>)";
+                # the last one wins (the presenter can stop mid-run).
+                rest = msg[len("present: "):]
+                name, _, why = rest.partition(" ")
+                out["present"] = {"backend": name, "detail": why.strip()[1:-1]
+                                  if why.strip().startswith("(") else why.strip()}
             elif msg.startswith("title returned"):
                 out["title_returned"] = True
             elif msg.startswith("FAILED"):
@@ -246,6 +254,8 @@ def parse_boot_log(text):
                                   "pitch": int(m.group(5)), "fbsum": m.group(6),
                                   "fbchanges": int(m.group(7))})
             continue
+        if line.startswith("[HOST] background") or line.startswith("[HOST] foreground"):
+            out["lifecycle"].append(line[len("[HOST] "):].split(":")[0])
         if line.startswith("[CRASH]"):
             out["crash"].append(line)
         elif line.startswith("[UNIMPL]"):

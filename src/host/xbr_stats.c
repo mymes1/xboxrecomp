@@ -38,6 +38,8 @@ void __real_xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 
 void __wrap_xbox_FramebufferWindowFrameStats(uint32_t draws)
 {
+    /* The app is in the background: the guest waits here (xbr_window.c). */
+    xbr_hold_point();
     __atomic_add_fetch(&s_flips, 1, __ATOMIC_RELAXED);
     __atomic_store_n(&s_draws, draws, __ATOMIC_RELAXED);
     __real_xbox_FramebufferWindowFrameStats(draws);

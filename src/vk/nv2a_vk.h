@@ -71,6 +71,73 @@ void nv2a_vk_shutdown(void);
 
 void nv2a_vk_get_stats(Nv2aVkStats *out);
 
+/* ---- window presentation (optional) -------------------------------------
+ *
+ * Shows finished frames in a window through a Vulkan swapchain on the
+ * renderer's device, instead of a second graphics API (the SDL renderer is
+ * GLES on Android). Frames come from guest memory -- what the flip's
+ * present_sync wrote back, or what the CPU rasteriser or the title drew --
+ * so every renderer is shown the same way. The window thread calls these;
+ * it shares the device and its queue with the executor (locked).
+ *
+ * Instance extensions: VK_KHR_surface and the platform's (from the window
+ * system, e.g. SDL_Vulkan_GetInstanceExtensions), all tested before they
+ * are enabled; device: VK_KHR_swapchain, only when the graphics queue can
+ * present to the window. Without them the presenter is off and the window
+ * uses its own renderer; the NV2A renderer is unaffected either way.
+ *
+ * Environment: RECOMP_PRESENT_VSYNC=0 (mailbox or immediate instead of
+ * FIFO), RECOMP_ASPECT=4:3 (default) | 16:9 | <w>:<h> | stretch | native,
+ * RECOMP_PRESENT_FILTER=linear (default) | nearest,
+ * RECOMP_PRESENT_CAPTURE=1 (tests: keep a copy of each presented image). */
+
+/* Makes a VkSurfaceKHR for `instance` (a VkInstance); 0 on success. Called
+ * on the thread that calls nv2a_vk_present_init / _frame. */
+typedef int (*Nv2aVkSurfaceFn)(void *ctx, void *instance, uint64_t *surface);
+
+typedef struct {
+    uint64_t presents, skipped;     /* frames shown; frames dropped (no window, timeouts) */
+    uint64_t swapchains, suspends;  /* swapchains made; times the window went away */
+    uint32_t width, height;         /* the swapchain's size */
+    int active;                     /* a swapchain exists now */
+} Nv2aVkPresentStats;
+
+/* Before nv2a_vk_register (it brings the device up with the surface
+ * extensions). 0: frames can be presented; negative: use another presenter
+ * (nv2a_vk_present_status says why). width/height: the window's size in
+ * pixels, used where the window system leaves the swapchain size open. */
+int nv2a_vk_present_init(const char *const *instance_exts, unsigned n_exts,
+                         Nv2aVkSurfaceFn create_surface, void *ctx,
+                         unsigned width, unsigned height);
+
+/* The swapchain (size, format, present mode, scaling) or "off: <why>". */
+const char *nv2a_vk_present_status(void);
+
+/* Shows a width x height frame (`pitch` bytes a row; bpp 2 = R5G6B5,
+ * 4 = X8R8G8B8), or with pixels NULL the last one again. 0: presented;
+ * 1: not now (no window, minimised, timed out) -- dropped; negative: the
+ * presenter is off for good and has released the window. */
+int nv2a_vk_present_frame(const void *pixels, unsigned width, unsigned height,
+                          unsigned pitch, unsigned bpp);
+
+/* The window changed size: a new swapchain at the next frame. */
+void nv2a_vk_present_resize(unsigned width, unsigned height);
+
+/* The window's surface is going away (Android: the app went to the
+ * background) / is back. Frames in between are dropped. */
+void nv2a_vk_present_suspend(void);
+void nv2a_vk_present_resume(void);
+
+void nv2a_vk_present_get_stats(Nv2aVkPresentStats *out);
+
+/* Tests (RECOMP_PRESENT_CAPTURE=1): the last presented image as RGBA8. */
+int nv2a_vk_present_capture(uint8_t *rgba, unsigned max_bytes,
+                            unsigned *width, unsigned *height);
+
+/* Releases the swapchain and the surface; the device goes once the
+ * renderer has shut down too. */
+void nv2a_vk_present_shutdown(void);
+
 #ifdef __cplusplus
 }
 #endif

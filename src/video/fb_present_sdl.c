@@ -32,6 +32,13 @@
  * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display;
  * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2);
  * RECOMP_FULLSCREEN=1 starts in borderless desktop fullscreen.
+ *
+ * [android-port] A host may install an external presenter first
+ * (fb_present_ext.h, xbox_FramebufferWindowSetPresenter): frames then go to
+ * it instead of the SDL renderer -- on Android, a Vulkan swapchain on the
+ * NV2A renderer's device -- and every event is passed to it. Without one,
+ * nothing here changes. If it cannot start, or fails later, the window falls
+ * back to the SDL renderer.
  */
 #if !defined(_WIN32)
 
@@ -48,6 +55,7 @@
 #include "video_player.h"
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 #include "xinput_xbox.h"
+#include "fb_present_ext.h"   /* [android-port] */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -269,6 +277,36 @@ static int env_on(const char *name)
     return e && *e && *e != '0';
 }
 
+/* [android-port] The host's presenter (fb_present_ext.h), and whether it is
+ * the one presenting (else the SDL renderer is). */
+static const XboxFbPresenter *s_ext;
+static int s_ext_on;
+
+void xbox_FramebufferWindowSetPresenter(const XboxFbPresenter *p)
+{
+    s_ext = p;
+}
+
+/* The presenter is off: the SDL renderer takes over the window. */
+static SDL_Renderer *ext_fallback(SDL_Window *win, int vsync)
+{
+    SDL_Renderer *ren;
+    SDL_RendererInfo ri;
+
+    s_ext_on = 0;
+    ren = SDL_CreateRenderer(win, -1, vsync ? SDL_RENDERER_PRESENTVSYNC : 0);
+    if (!ren) {
+        fprintf(stderr, "  [FBWIN] %s presenter stopped and no SDL renderer (%s);"
+                        " nothing is shown from here\n", s_ext->name, SDL_GetError());
+        return NULL;
+    }
+    SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H);
+    if (SDL_GetRendererInfo(ren, &ri) == 0)
+        fprintf(stderr, "  [FBWIN] %s presenter stopped; the SDL %s renderer shows frames\n",
+                s_ext->name, ri.name);
+    return ren;
+}
+
 int xbox_HostWindowMain(int (*guest_main)(void))
 {
     SDL_Window *win;
@@ -278,6 +316,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
     const char *e;
     int vsync, scale, quit = 0, guest_done = 0, dirty = 1;
+    /* [android-port] external presenter: a frame shown yet; a frame it
+     * could not show now (no surface), to show when it can. */
+    int ext_shown = 0;
+    const uint8_t *retry_px = NULL;
+    uint32_t retry_bpp = 0, retry_pitch = 0;
 
     /* Ctrl-C and SIGTERM keep their default meaning; SDL would turn them
      * into an SDL_QUIT that a headless run never reads. Set before the
@@ -303,14 +346,40 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     Uint32 window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
     if (env_on("RECOMP_FULLSCREEN"))
         window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    if (s_ext)
+        window_flags |= s_ext->window_flags;
 
     win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                            (int)FB_W * scale, (int)FB_H * scale,
                            window_flags);
-    ren = win ? SDL_CreateRenderer(win, -1,
-                                   vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
-              : NULL;
-    if (!ren) {
+    if (!win && s_ext && s_ext->window_flags) {
+        /* The presenter's kind of window is not available (no Vulkan):
+         * a plain one for the SDL renderer. */
+        fprintf(stderr, "  [FBWIN] no %s window (%s); using the SDL renderer\n",
+                s_ext->name, SDL_GetError());
+        window_flags &= ~s_ext->window_flags;
+        win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                               (int)FB_W * scale, (int)FB_H * scale, window_flags);
+    } else if (win && s_ext && s_ext->open) {
+        char msg[512];
+        msg[0] = 0;
+        if (s_ext->open(win, msg, sizeof msg) == 0) {
+            s_ext_on = 1;
+            fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, %s presenter: %s);"
+                            " guest runs on a pthread\n", FB_W, FB_H, s_ext->name, msg);
+        } else {
+            fprintf(stderr, "  [FBWIN] %s presenter unavailable (%s); using the SDL renderer\n",
+                    s_ext->name, msg);
+        }
+    }
+    /* With the presenter in use there is no SDL renderer: on Android it
+     * would be a second graphics API on the same window. A Vulkan window
+     * the presenter declined is turned into one the renderer can use by
+     * SDL_CreateRenderer itself (SDL_RecreateWindow). */
+    ren = win && !s_ext_on ? SDL_CreateRenderer(win, -1,
+                                                vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
+                           : NULL;
+    if (!ren && !s_ext_on) {
         fprintf(stderr, "  [FBWIN] SDL window/renderer failed (%s); running headless\n",
                 SDL_GetError());
         if (win)
@@ -318,9 +387,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
         return guest_main();
     }
-    SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H);
-    {
+    if (ren) {
         SDL_RendererInfo ri;
+        SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H);
         if (SDL_GetRendererInfo(ren, &ri) == 0)
             fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, SDL %s renderer,"
                     " vsync %s); guest runs on a pthread\n",
@@ -330,7 +399,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     s_guest_done_event = SDL_RegisterEvents(2);
     if (s_guest_done_event == (Uint32)-1) {
         fprintf(stderr, "  [FBWIN] SDL_RegisterEvents failed; running headless\n");
-        SDL_DestroyRenderer(ren);
+        if (s_ext_on && s_ext->close)
+            s_ext->close();
+        if (ren)
+            SDL_DestroyRenderer(ren);
         SDL_DestroyWindow(win);
         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
         return guest_main();
@@ -346,7 +418,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         fprintf(stderr, "  [FBWIN] cannot start the guest thread; running headless\n");
         s_running = 0;
         xbox_InputSetMainPump(0);
-        SDL_DestroyRenderer(ren);
+        if (s_ext_on && s_ext->close)
+            s_ext->close();
+        if (ren)
+            SDL_DestroyRenderer(ren);
         SDL_DestroyWindow(win);
         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
         return guest_main();
@@ -366,6 +441,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 /* Keys for the pad stand-in, and the window events that
                  * release them; it only reads the event. */
                 xbox_InputSdlEvent(&ev);
+                if (s_ext && s_ext->event)              /* [android-port] */
+                    s_ext->event(&ev);
                 if (ev.type == SDL_QUIT)
                     quit = 1;
                 else if (ev.type == s_guest_done_event)
@@ -374,7 +451,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     __atomic_store_n(&s_wake_pending, 0, __ATOMIC_RELEASE);
                 else if (ev.type == SDL_WINDOWEVENT
                          && (ev.window.event == SDL_WINDOWEVENT_EXPOSED
-                             || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED))
+                             || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED
+                             || ev.window.event == SDL_WINDOWEVENT_RESTORED))
+                    dirty = 1;
+                else if (ev.type == SDL_APP_DIDENTERFOREGROUND)  /* [android-port] */
                     dirty = 1;
             } while (SDL_PollEvent(&ev));
         }
@@ -400,7 +480,42 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             if (bpp == 2 || bpp == 4)
                 px = (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
         }
-        if (px) {
+        /* [android-port] The host's presenter, while it is in use. A frame
+         * it cannot show now (1: no surface yet, e.g. just after an Android
+         * resume) is offered again on the next pass until a newer one
+         * arrives; on failure the SDL renderer takes over this frame. */
+        if (s_ext_on) {
+            int r = 0, redraw = 0;
+            if (!px && retry_px) {
+                px = retry_px;
+                bpp = retry_bpp;
+                pitch = retry_pitch;
+            }
+            retry_px = NULL;
+            if (px)
+                r = s_ext->present(px, FB_W, FB_H, pitch, bpp);
+            else if (dirty && ext_shown)
+                r = s_ext->present(NULL, 0, 0, 0, 0), redraw = 1;
+            if (r < 0) {
+                ren = ext_fallback(win, vsync);
+                dirty = 1;
+                ext_shown = 0;
+            } else {
+                if (r == 0 && (px || redraw))
+                    ext_shown = 1;
+                if (r == 1 && px) {
+                    retry_px = px;
+                    retry_bpp = bpp;
+                    retry_pitch = pitch;
+                } else if (r == 1) {
+                    dirty = 1;              /* the redraw, again */
+                }
+                if (r != 1 || px)
+                    dirty = 0;
+                px = NULL;
+            }
+        }
+        if (px && ren) {
             if (!tex || bpp != tex_bpp) {
                 if (tex)
                     SDL_DestroyTexture(tex);
@@ -414,7 +529,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 SDL_UpdateTexture(tex, NULL, px, (int)pitch);
             dirty = 1;
         }
-        if (dirty) {
+        if (dirty && ren) {
             dirty = 0;
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderClear(ren);
@@ -450,9 +565,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * the game controllers, so with one open SDL stays up and exit()
      * reclaims it. The main-pump flag stays set, so those threads do not
      * start calling SDL_GameControllerUpdate while SDL goes down. */
+    if (s_ext_on && s_ext->close)                    /* [android-port] */
+        s_ext->close();
+    s_ext_on = 0;
     if (tex)
         SDL_DestroyTexture(tex);
-    SDL_DestroyRenderer(ren);
+    if (ren)
+        SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     if (!xbox_InputAnyOpen())
         SDL_Quit();

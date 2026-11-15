@@ -51,5 +51,6 @@ int main(int argc, char **argv)
         sigaddset(&set, SIGPIPE);
         pthread_sigmask(SIG_BLOCK, &set, NULL);
     }
+    xbr_window_install();           /* RECOMP_PRESENT=vulkan: the Vulkan presenter */
     return xbox_HostWindowMain(guest_main);
 }

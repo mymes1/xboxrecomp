@@ -166,7 +166,9 @@ int SDL_main(int argc, char *argv[])
     xbr_boot_env_defaults();
 
     {
-        int rc = xbox_HostWindowMain(guest_main);
+        int rc;
+        xbr_window_install();       /* the Vulkan presenter, the app lifecycle */
+        rc = xbox_HostWindowMain(guest_main);
         printf("[BOOT] SDL_main returning %d\n", rc);
         xbr_android_log_stop();
         return rc;

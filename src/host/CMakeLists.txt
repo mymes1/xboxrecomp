@@ -13,6 +13,7 @@ add_library(xboxrecomp_host STATIC
     xbr_boot.c
     xbr_game_glue.c
     xbr_stats.c
+    xbr_window.c
 )
 # xbr_stats.c sees flips and the scanout surface by wrapping two presenter
 # entry points at link time (no change to the presenter or the executor).

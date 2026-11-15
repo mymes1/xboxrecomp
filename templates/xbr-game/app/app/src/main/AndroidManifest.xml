@@ -23,10 +23,13 @@
         android:hardwareAccelerated="true"
         android:theme="@style/XbrTheme">
 
+        <!-- singleTop, not singleTask: tapping the icon while a game runs must
+             bring the task back with the game on top. A singleTask root would
+             take the intent itself and finish the activities above it. -->
         <activity
             android:name=".LauncherActivity"
             android:exported="true"
-            android:launchMode="singleTask"
+            android:launchMode="singleTop"
             android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
             <intent-filter>

@@ -116,6 +116,23 @@ class BootLogTest(unittest.TestCase):
         self.assertEqual(len(r["unimpl"]), 1)
         self.assertEqual(r["status"][1]["display"], "0x83E00000")
 
+    def test_present_and_lifecycle_lines(self):
+        r = native.parse_boot_log(
+            "[BOOT] present: vulkan (swapchain 2400x1080 B8G8R8A8_UNORM, 3 images, FIFO (vsync),"
+            " letterboxed linear)\n"
+            "[HOST] background: presenter suspended, guest held at its next flip\n"
+            "[HOST] foreground: presenter resumed, guest released\n")
+        self.assertEqual(r["present"]["backend"], "vulkan")
+        self.assertTrue(r["present"]["detail"].startswith("swapchain 2400x1080"))
+        self.assertTrue(r["present"]["detail"].endswith("letterboxed linear"))
+        self.assertEqual(r["lifecycle"], ["background", "foreground"])
+        # The presenter can stop mid-run: the last line wins.
+        r = native.parse_boot_log("[BOOT] present: vulkan (swapchain 1x1)\n"
+                                  "[BOOT] present: sdl (the Vulkan presenter stopped: off: x)\n")
+        self.assertEqual(r["present"]["backend"], "sdl")
+        self.assertIn("stopped", r["present"]["detail"])
+        self.assertNotIn("present", native.parse_boot_log(BOOT_LOG))
+
     def test_render_line(self):
         r = native.parse_boot_log(
             "[BOOT] render: vulkan (Vulkan 1.3.0 on Mali-G57 MC2 (integrated GPU), depth D24S8)\n")
