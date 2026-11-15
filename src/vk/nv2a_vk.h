@@ -44,6 +44,7 @@ extern "C" {
 typedef struct {
     uint64_t draws, triangles, clears;
     uint64_t pipelines;             /* created so far */
+    uint64_t pipeline_build_us;     /* time spent creating them (driver compile) */
     uint64_t texture_uploads, texture_bytes;
     uint64_t surface_uploads, readbacks, readback_bytes;
     uint64_t submits, render_passes;

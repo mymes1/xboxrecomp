@@ -47,6 +47,7 @@
 
 #include <dlfcn.h>
 #include <stdarg.h>
+#include <time.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -290,6 +291,13 @@ static uint8_t *guest(uint32_t addr)
 static int overlap(uint32_t a, uint32_t an, uint32_t b, uint32_t bn)
 {
     return (uint64_t)a < (uint64_t)b + bn && (uint64_t)b < (uint64_t)a + an;
+}
+
+static uint64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
 
 static uint64_t rotl64(uint64_t x, int r)
@@ -1400,6 +1408,7 @@ static VkPipeline pipe_create(const NvkPipeKey *k)
     VkPipelineDynamicStateCreateInfo dy;
     VkGraphicsPipelineCreateInfo ci;
     VkPipeline p = VK_NULL_HANDLE;
+    uint64_t t0 = now_us(), dt;
     int i;
 
     for (i = 0; i < NVK_NSPEC; i++) {
@@ -1515,7 +1524,15 @@ static VkPipeline pipe_create(const NvkPipeKey *k)
     if (!ck(vk.CreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p),
             "vkCreateGraphicsPipelines"))
         return VK_NULL_HANDLE;
+    dt = now_us() - t0;
     V.st.pipelines++;
+    V.st.pipeline_build_us += dt;
+    /* A pipeline is built the first time a combiner program is drawn with,
+     * mid-frame: the stutter shader compilation costs on a phone GPU. */
+    if (V.stats_every > 0)
+        nvk_log("pipeline %llu: %.1f ms (combiner stages %u, stage program 0x%05X)",
+                (unsigned long long)V.st.pipelines, (double)dt / 1000.0,
+                k->spec[36] ? (k->spec[34] & 0xFF) : 0, k->spec[35]);
     return p;
 }
 

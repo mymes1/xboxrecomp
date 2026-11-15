@@ -263,8 +263,6 @@ static void flip(void)
     m(0x0130, 0);                               /* FLIP_STALL: present_sync */
 }
 
-static void combiners_off_fixed(void) {}
-
 /* ---- scenes ------------------------------------------------------------------- */
 static void scene_gouraud(void)
 {
@@ -300,9 +298,13 @@ static void scene_textured(void)
     v[4] = V4(250, 130, 0, 4, 0xFFFFFFFFu, 1, 1);
     v[5] = V4(140, 130, 0, 4, 0xFFFFFFFFu, 0, 1);
     draw(v, 6, 1);
-    /* linear texture (texel coordinates), mirrored, modulated by a colour */
+    /* linear texture (texel coordinates), mirrored, modulated by a colour.
+     * The coordinates avoid round ratios on purpose: where a pixel centre
+     * samples exactly on a texel boundary (-24..96 over 236 pixels puts
+     * column 39 at u = -9.0) either texel is right, and float rounding
+     * picks differently on the two renderers. */
     tex_linear(0, TEX_LIN, 48, 40, 192, MIRROR, NEAREST);
-    n = quad(v, 10, 145, 246, 250, 0, 0xFFC0FFA0u, -24.0f, -10.0f, 96.0f, 70.0f);
+    n = quad(v, 10, 145, 246, 250, 0, 0xFFC0FFA0u, -24.37f, -10.21f, 95.83f, 69.67f);
     draw(v, n, 1);
     flip();
 }
@@ -441,10 +443,12 @@ static void scene_alphatest(void)
     m(0x1E40, 0xCu << 4);
     m(0x0AA0, 0xCu << 4);
     m(0x0288, 0); m(0x028C, 0);
-    /* near quad, alpha-tested: cut texels must not write depth */
+    /* near quad, alpha-tested: cut texels must not write depth. Coordinates
+     * a hundredth of a texel off the grid, so no pixel centre samples exactly
+     * on a texel boundary (see scene_textured). */
     m(0x030C, 1); m(0x0354, 0x203); m(0x035C, 1);
     m(0x0300, 1); m(0x033C, 0x204); m(0x0340, 0x80);   /* GREATER 0x80 */
-    n = quad(v, 16, 16, 240, 240, 0.25f * ZMAX, 0xFFFFFFFFu, 0, 0, 2, 2);
+    n = quad(v, 16, 16, 240, 240, 0.25f * ZMAX, 0xFFFFFFFFu, 0.01f, 0.01f, 2.01f, 2.01f);
     draw(v, n, 1);
     /* far quad, untested: shows through only where the first was cut */
     m(0x0300, 0);
@@ -645,7 +649,6 @@ int main(void)
     s_mem = (uint8_t *)calloc(1, MEM_BYTES);
     if (!s_mem)
         return 1;
-    (void)combiners_off_fixed;
     if (nv2a_vk_register() != 0) {
         printf("SKIP: no Vulkan back end: %s\n", nv2a_vk_status());
         return 77;
@@ -689,10 +692,11 @@ int main(void)
     }
     fail |= stencil_scene(outdir);
     nv2a_vk_get_stats(&st);
-    printf("vk: %llu draws, %llu triangles, %llu clears, %llu pipelines, %llu texture uploads,"
-           " %llu surface uploads, %llu readbacks, %llu submits\n",
+    printf("vk: %llu draws, %llu triangles, %llu clears, %llu pipelines (%.1f s to build),"
+           " %llu texture uploads, %llu surface uploads, %llu readbacks, %llu submits\n",
            (unsigned long long)st.draws, (unsigned long long)st.triangles,
            (unsigned long long)st.clears, (unsigned long long)st.pipelines,
+           (double)st.pipeline_build_us / 1e6,
            (unsigned long long)st.texture_uploads, (unsigned long long)st.surface_uploads,
            (unsigned long long)st.readbacks, (unsigned long long)st.submits);
     if (!st.draws || !st.readbacks) {
