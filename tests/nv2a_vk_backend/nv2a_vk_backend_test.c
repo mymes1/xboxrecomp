@@ -22,8 +22,13 @@
  *   stencil     (Vulkan only: the CPU path has no stencil) replace, then
  *               test EQUAL -- checked against the expected pixels
  *
+ * Then the pipeline cache (RECOMP_VK_CACHE): the scenes' pipelines are saved
+ * at shutdown and offered to the driver at the next start; a damaged,
+ * truncated or foreign file, or one from other shaders, is not.
+ *
  * Exit 77 (ctest SKIP_RETURN_CODE) when there is no Vulkan device.
  * RECOMP_VK_TEST_OUT=<dir> writes both renderings of every scene as PPM. */
+#define _POSIX_C_SOURCE 200809L         /* setenv */
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -639,12 +644,124 @@ static int stencil_scene(const char *outdir)
     return bad != 0;
 }
 
+/* ---- pipeline cache ------------------------------------------------------ */
+
+static uint8_t *slurp(const char *path, long *n)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t *b = NULL;
+    *n = -1;
+    if (!f)
+        return NULL;
+    if (fseek(f, 0, SEEK_END) == 0 && (*n = ftell(f)) > 0 && fseek(f, 0, SEEK_SET) == 0) {
+        b = (uint8_t *)malloc((size_t)*n);
+        if (b && fread(b, 1, (size_t)*n, f) != (size_t)*n) {
+            free(b);
+            b = NULL;
+        }
+    }
+    fclose(f);
+    return b;
+}
+
+static int spill(const char *path, const uint8_t *b, long n)
+{
+    FILE *f = fopen(path, "wb");
+    int ok = f && fwrite(b, 1, (size_t)n, f) == (size_t)n;
+    if (f)
+        ok = (fclose(f) == 0) && ok;
+    return ok;
+}
+
+static uint64_t t_fnv1a64(const uint8_t *p, size_t n)
+{
+    uint64_t h = 1469598103934665603ull;
+    while (n--) {
+        h ^= *p++;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+/* Start the back end with `path` as it is, expect `want` in the status line
+ * (and a load exactly when `loaded`), shut down again. */
+static int pc_start(const char *what, const char *want, int loaded)
+{
+    Nv2aVkStats st;
+    const char *s, *pc;
+    int bad;
+
+    if (nv2a_vk_register() != 0) {
+        printf("FAIL pipeline cache (%s): %s\n", what, nv2a_vk_status());
+        return 1;
+    }
+    nv2a_backend_register(NULL);
+    nv2a_vk_get_stats(&st);
+    s = nv2a_vk_status();
+    pc = strstr(s, "pipeline cache");
+    bad = !pc || !strstr(pc, want) || (loaded != (st.pcache_load_bytes > 0));
+    printf("%s pipeline cache (%s): %s\n", bad ? "FAIL" : "PASS", what, pc ? pc : s);
+    nv2a_vk_shutdown();
+    return bad;
+}
+
+static int pipeline_cache_checks(const char *path)
+{
+    uint8_t *good, *b;
+    long n;
+    uint64_t h;
+    int fail = 0;
+
+    good = slurp(path, &n);
+    if (!good || n < 32 + 32) {
+        printf("FAIL pipeline cache: nothing saved at shutdown (%s, %ld bytes)\n", path, n);
+        free(good);
+        return 1;
+    }
+    printf("PASS pipeline cache: %ld bytes saved at shutdown\n", n);
+    fail |= pc_start("saved file", "loaded", 1);
+
+    b = (uint8_t *)malloc((size_t)n);
+    memcpy(b, good, (size_t)n);
+    b[32 + 20] ^= 0x40;                     /* inside the payload; checksum stale */
+    fail |= !spill(path, b, n) || pc_start("one byte flipped", "ignored (checksum)", 0);
+
+    memcpy(b, good, (size_t)n);
+    b[32 + 8] ^= 0x01;                      /* payload's vendorID, checksum fixed */
+    h = t_fnv1a64(b + 32, (size_t)n - 32);
+    memcpy(b + 16, &h, 8);
+    fail |= !spill(path, b, n) || pc_start("another device", "another device", 0);
+
+    memcpy(b, good, (size_t)n);
+    b[24] ^= 0x01;                          /* the SPIR-V hash */
+    fail |= !spill(path, b, n) || pc_start("other shaders", "the shaders changed", 0);
+
+    fail |= !spill(path, good, n - 1) || pc_start("truncated", "truncated", 0);
+
+    fail |= !spill(path, (const uint8_t *)"not a cache file at all, really", 32)
+            || pc_start("foreign file", "not a pipeline cache", 0);
+
+    remove(path);
+    fail |= pc_start("no file", "pipeline cache new", 0);
+    free(b);
+    free(good);
+    return fail;
+}
+
 int main(void)
 {
     const char *outdir = getenv("RECOMP_VK_TEST_OUT");
     size_t i;
     int fail = 0;
     Nv2aVkStats st;
+
+    char pc_path[1024];
+
+    snprintf(pc_path, sizeof pc_path, "%s/nv2a_vk_test_pipeline_cache.bin",
+             outdir && *outdir ? outdir
+                               : (getenv("TMPDIR") && *getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp"));
+    remove(pc_path);
+    setenv("RECOMP_VK_CACHE", pc_path, 1);
 
     s_mem = (uint8_t *)calloc(1, MEM_BYTES);
     if (!s_mem)
@@ -655,6 +772,10 @@ int main(void)
     }
     nv2a_backend_register(NULL);
     printf("Vulkan back end: %s\n", nv2a_vk_status());
+    if (!strstr(nv2a_vk_status(), "pipeline cache new")) {
+        printf("FAIL pipeline cache: a first start should report \"pipeline cache new\"\n");
+        fail = 1;
+    }
 
     for (i = 0; i < sizeof k_scenes / sizeof k_scenes[0]; i++) {
         const Scene *sc = &k_scenes[i];
@@ -703,7 +824,8 @@ int main(void)
         printf("FAIL: the Vulkan back end drew nothing\n");
         fail = 1;
     }
-    nv2a_vk_shutdown();
+    nv2a_vk_shutdown();                     /* saves the pipeline cache */
+    fail |= pipeline_cache_checks(pc_path);
     free(s_mem);
     printf(fail ? "nv2a_vk_backend: FAIL\n" : "nv2a_vk_backend: PASS\n");
     return fail;

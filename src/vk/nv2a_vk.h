@@ -48,6 +48,8 @@ typedef struct {
     uint64_t texture_uploads, texture_bytes;
     uint64_t surface_uploads, readbacks, readback_bytes;
     uint64_t submits, render_passes;
+    uint64_t pcache_load_bytes;     /* pipeline cache accepted at start (RECOMP_VK_CACHE) */
+    uint64_t pcache_saves, pcache_save_bytes;   /* writes this run; size of the last */
 } Nv2aVkStats;
 
 /* Bring Vulkan up (first call) and register as the executor's back end.

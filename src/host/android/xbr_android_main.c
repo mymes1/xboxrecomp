@@ -139,6 +139,18 @@ int SDL_main(int argc, char *argv[])
            s_save_dir, s_log_path);
     mkdirs(s_save_dir);
 
+    /* The Vulkan back end keeps the driver's pipeline cache across runs
+     * (src/vk/nv2a_vk.c), in app-private internal storage. --env
+     * RECOMP_VK_CACHE=0 turns it off. */
+    if (!getenv("RECOMP_VK_CACHE")) {
+        const char *in = SDL_AndroidGetInternalStoragePath();
+        char dir[1100], file[1200];
+        snprintf(dir, sizeof dir, "%s/cache", in && *in ? in : s_save_dir);
+        mkdirs(dir);
+        snprintf(file, sizeof file, "%s/vk_pipeline_cache.bin", dir);
+        setenv("RECOMP_VK_CACHE", file, 1);
+    }
+
     memset(&s_opts, 0, sizeof s_opts);
     xbr_boot_options_from_config(&s_opts);
     s_opts.game_dir = s_game_dir;

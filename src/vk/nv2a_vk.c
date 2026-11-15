@@ -46,7 +46,9 @@
 #include <vulkan/vulkan.h>
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <stdarg.h>
+#include <unistd.h>
 #include <time.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -79,7 +81,7 @@ ptrdiff_t xbox_GetMemoryOffset(void);      /* xbox_memory_layout.h */
     X(CreateBuffer) X(DestroyBuffer) X(CreateImage) X(DestroyImage)            \
     X(CreateImageView) X(DestroyImageView)                                     \
     X(CreateShaderModule) X(DestroyShaderModule)                               \
-    X(CreatePipelineCache) X(DestroyPipelineCache)                             \
+    X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData)     \
     X(CreateGraphicsPipelines) X(DestroyPipeline)                              \
     X(CreatePipelineLayout) X(DestroyPipelineLayout)                           \
     X(CreateSampler) X(DestroySampler)                                         \
@@ -207,7 +209,7 @@ typedef struct {
 
 static struct {
     int ok, registered, init_tried;
-    char status[512];
+    char status[768];
     void *lib;
     VkInstance inst;
     VkPhysicalDevice phys;
@@ -242,6 +244,10 @@ static struct {
     NvkDepth *pass_depth;
     uint64_t frame, epoch, clock;
     int cull, bilinear, stats_every;
+    char pc_path[1024];             /* RECOMP_VK_CACHE; empty = not kept */
+    char pc_state[96];              /* for the status line */
+    int pc_dirty;                   /* pipelines built since the last save */
+    uint64_t pc_new_frame;          /* frame of the newest one */
     NvkImage *dead_img;
     int dead_img_n, dead_img_cap;
     VkFramebuffer *dead_fb;
@@ -1527,6 +1533,8 @@ static VkPipeline pipe_create(const NvkPipeKey *k)
     dt = now_us() - t0;
     V.st.pipelines++;
     V.st.pipeline_build_us += dt;
+    V.pc_dirty = 1;
+    V.pc_new_frame = V.frame;
     /* A pipeline is built the first time a combiner program is drawn with,
      * mid-frame: the stutter shader compilation costs on a phone GPU. */
     if (V.stats_every > 0)
@@ -1941,6 +1949,162 @@ static void vk_clear_ex(const Nv2aSurfaceEx *sx, const Nv2aRenderState *rs,
     V.st.clears++;
 }
 
+/* ---- pipeline cache on disk ---------------------------------------------- */
+
+/* Pipelines are built the first time a combiner program is drawn with, and
+ * a phone driver compiles each one in tens of milliseconds: a stutter every
+ * time the game shows something new, again on every start. With
+ * RECOMP_VK_CACHE=<file> (set by the Android host) the driver's pipeline
+ * cache is kept across runs.
+ *
+ * File: "XBRVKPC1", u32 payload length, u32 0, u64 FNV-1a of the payload,
+ * u64 FNV-1a of this build's SPIR-V; then the vkGetPipelineCacheData bytes.
+ * The payload reaches the driver only when the file is whole and its Vulkan
+ * header names this device, driver build and shaders: some mobile drivers
+ * misbehave on damaged or foreign cache data instead of ignoring it. Saved
+ * through a temporary file and a rename, so a crash mid-write leaves the
+ * old file. */
+
+#define NVK_PC_MAGIC "XBRVKPC1"
+#define NVK_PC_HDR 32u
+#define NVK_PC_MAX (64u << 20)
+#define NVK_PC_SAVE_FRAMES 300u      /* save once no pipeline was new for this long */
+
+static uint64_t fnv1a64(uint64_t h, const void *data, size_t n)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    while (n--) {
+        h ^= *p++;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static uint64_t pc_shader_hash(void)
+{
+    uint64_t h = fnv1a64(1469598103934665603ull, nv2a_vk_vert_spv, sizeof nv2a_vk_vert_spv);
+    return fnv1a64(h, nv2a_vk_frag_spv, sizeof nv2a_vk_frag_spv);
+}
+
+/* The file's payload when it may be given to this device, else NULL with
+ * V.pc_state saying why. */
+static void *pc_load(size_t *len)
+{
+    VkPhysicalDeviceProperties p;
+    uint8_t hdr[NVK_PC_HDR], *buf;
+    uint32_t n, vhl, vver, vven, vdev;
+    uint64_t h, sh;
+    FILE *f;
+
+    *len = 0;
+    f = fopen(V.pc_path, "rb");
+    if (!f) {
+        snprintf(V.pc_state, sizeof V.pc_state, "new");
+        return NULL;
+    }
+    if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr || memcmp(hdr, NVK_PC_MAGIC, 8) != 0) {
+        fclose(f);
+        snprintf(V.pc_state, sizeof V.pc_state, "ignored (not a pipeline cache file)");
+        return NULL;
+    }
+    memcpy(&n, hdr + 8, 4);
+    memcpy(&h, hdr + 16, 8);
+    memcpy(&sh, hdr + 24, 8);
+    if (n < 16 + VK_UUID_SIZE || n > NVK_PC_MAX) {
+        fclose(f);
+        snprintf(V.pc_state, sizeof V.pc_state, "ignored (bad length %u)", n);
+        return NULL;
+    }
+    buf = (uint8_t *)malloc(n);
+    if (!buf || fread(buf, 1, n, f) != n || fgetc(f) != EOF) {
+        fclose(f);
+        free(buf);
+        snprintf(V.pc_state, sizeof V.pc_state, "ignored (truncated or wrong length)");
+        return NULL;
+    }
+    fclose(f);
+    if (fnv1a64(1469598103934665603ull, buf, n) != h) {
+        free(buf);
+        snprintf(V.pc_state, sizeof V.pc_state, "ignored (checksum)");
+        return NULL;
+    }
+    if (sh != pc_shader_hash()) {
+        free(buf);
+        snprintf(V.pc_state, sizeof V.pc_state, "new (the shaders changed)");
+        return NULL;
+    }
+    /* VkPipelineCacheHeaderVersionOne */
+    vk.GetPhysicalDeviceProperties(V.phys, &p);
+    memcpy(&vhl, buf, 4);
+    memcpy(&vver, buf + 4, 4);
+    memcpy(&vven, buf + 8, 4);
+    memcpy(&vdev, buf + 12, 4);
+    if (vhl < 16 + VK_UUID_SIZE || vhl > n || vver != VK_PIPELINE_CACHE_HEADER_VERSION_ONE
+        || vven != p.vendorID || vdev != p.deviceID
+        || memcmp(buf + 16, p.pipelineCacheUUID, VK_UUID_SIZE) != 0) {
+        free(buf);
+        snprintf(V.pc_state, sizeof V.pc_state, "new (another device or driver build)");
+        return NULL;
+    }
+    *len = n;
+    return buf;
+}
+
+static void pc_save(const char *why)
+{
+    char tmp[1100];
+    uint8_t hdr[NVK_PC_HDR];
+    size_t n = 0;
+    uint32_t n32;
+    uint64_t h;
+    void *buf;
+    FILE *f;
+    int ok;
+
+    V.pc_dirty = 0;
+    if (!V.pc_path[0] || !V.pcache)
+        return;
+    if (vk.GetPipelineCacheData(V.dev, V.pcache, &n, NULL) != VK_SUCCESS || !n || n > NVK_PC_MAX)
+        return;
+    buf = malloc(n);
+    if (!buf)
+        return;
+    if (vk.GetPipelineCacheData(V.dev, V.pcache, &n, buf) != VK_SUCCESS) {
+        free(buf);                          /* grew in between: next time */
+        V.pc_dirty = 1;
+        return;
+    }
+    n32 = (uint32_t)n;
+    h = fnv1a64(1469598103934665603ull, buf, n);
+    memset(hdr, 0, sizeof hdr);
+    memcpy(hdr, NVK_PC_MAGIC, 8);
+    memcpy(hdr + 8, &n32, 4);
+    memcpy(hdr + 16, &h, 8);
+    h = pc_shader_hash();
+    memcpy(hdr + 24, &h, 8);
+    snprintf(tmp, sizeof tmp, "%s.tmp", V.pc_path);
+    f = fopen(tmp, "wb");
+    if (!f) {
+        nvk_log("pipeline cache: cannot write %s (%s); not kept this run", tmp, strerror(errno));
+        V.pc_path[0] = 0;
+        free(buf);
+        return;
+    }
+    ok = fwrite(hdr, 1, sizeof hdr, f) == sizeof hdr && fwrite(buf, 1, n, f) == n
+         && fflush(f) == 0 && fsync(fileno(f)) == 0;
+    ok = (fclose(f) == 0) && ok;
+    free(buf);
+    if (!ok || rename(tmp, V.pc_path) != 0) {
+        nvk_log("pipeline cache: writing %s failed (%s)", V.pc_path, strerror(errno));
+        remove(tmp);
+        return;
+    }
+    V.st.pcache_saves++;
+    V.st.pcache_save_bytes = n;
+    if (V.stats_every > 0)
+        nvk_log("pipeline cache: %zu bytes saved (%s)", n, why);
+}
+
 static void vk_print_stats(void)
 {
     nvk_log("frame %llu: draws %llu tris %llu clears %llu pipelines %llu tex %llu (%llu KB)"
@@ -1970,6 +2134,10 @@ static void vk_present_sync(void)
     tex_frame();
     if (V.stats_every > 0 && V.frame % (uint64_t)V.stats_every == 0)
         vk_print_stats();
+    /* After a burst of new pipelines (a new area, a menu) has settled, so the
+     * write is one short hitch rather than one per pipeline. */
+    if (V.pc_dirty && V.frame - V.pc_new_frame >= NVK_PC_SAVE_FRAMES)
+        pc_save("idle");
 }
 
 static void vk_flip(void)
@@ -2386,7 +2554,31 @@ static int create_objects(void)
         return 0;
     memset(&pc, 0, sizeof pc);
     pc.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
-    if (!ck(vk.CreatePipelineCache(V.dev, &pc, NULL, &V.pcache), "vkCreatePipelineCache"))
+    if (V.pc_path[0]) {
+        size_t n;
+        void *data = pc_load(&n);
+        if (data) {
+            pc.initialDataSize = n;
+            pc.pInitialData = data;
+            if (vk.CreatePipelineCache(V.dev, &pc, NULL, &V.pcache) == VK_SUCCESS) {
+                V.st.pcache_load_bytes = n;
+                if (n >= 10240)
+                    snprintf(V.pc_state, sizeof V.pc_state, "%zu KB loaded", n >> 10);
+                else
+                    snprintf(V.pc_state, sizeof V.pc_state, "%zu bytes loaded", n);
+            } else {
+                V.pcache = VK_NULL_HANDLE;
+                snprintf(V.pc_state, sizeof V.pc_state, "new (the driver refused the file)");
+            }
+            free(data);
+            pc.initialDataSize = 0;
+            pc.pInitialData = NULL;
+        }
+    } else {
+        snprintf(V.pc_state, sizeof V.pc_state, "off");
+    }
+    if (!V.pcache
+        && !ck(vk.CreatePipelineCache(V.dev, &pc, NULL, &V.pcache), "vkCreatePipelineCache"))
         return 0;
 
     if (!buf_create(&V.vring, NVK_VERT_RING, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 0)
@@ -2428,6 +2620,9 @@ static void read_env(void)
     const char *e;
     e = getenv("RECOMP_VK_CULL");
     V.cull = e && strcmp(e, "0") != 0;
+    e = getenv("RECOMP_VK_CACHE");
+    if (e && *e && strcmp(e, "0") != 0)
+        snprintf(V.pc_path, sizeof V.pc_path, "%s", e);
     e = getenv("RECOMP_VK_STATS");
     V.stats_every = e ? atoi(e) : 0;
     if (e && V.stats_every <= 0 && strcmp(e, "0") != 0)
@@ -2472,11 +2667,12 @@ static int nvk_init(void)
         return -1;                          /* nvk_fail wrote the status */
     }
     snprintf(V.status, sizeof V.status,
-             "Vulkan %u.%u.%u on %s (%s, driver 0x%08X, vendor 0x%04X), depth %s, %s",
+             "Vulkan %u.%u.%u on %s (%s, driver 0x%08X, vendor 0x%04X), depth %s, %s,"
+             " pipeline cache %s",
              VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion),
              VK_VERSION_PATCH(p.apiVersion), p.deviceName, dev_type(p.deviceType),
              p.driverVersion, p.vendorID,
-             V.depth_fmt == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8", feat);
+             V.depth_fmt == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8", feat, V.pc_state);
     nvk_log("%s", V.status);
     return 0;
 }
@@ -2523,8 +2719,11 @@ void nv2a_vk_shutdown(void)
         V.registered = 0;
     }
     if (V.dev) {
-        if (V.ok)
+        if (V.ok) {
             nv2a_vk_sync();
+            if (V.pc_dirty)
+                pc_save("shutdown");
+        }
         vk.DeviceWaitIdle(V.dev);
         V.recording = 0;
         for (i = 0; i < V.dead_img_n; i++)
