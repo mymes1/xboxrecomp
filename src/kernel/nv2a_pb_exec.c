@@ -794,7 +794,13 @@ void nv2a_backend_register(const Nv2aBackend *backend)
 
 static int backend_draws(void)
 {
-    return s_backend && s_backend->draw;
+    return s_backend && (s_backend->draw || s_backend->draw_ex);
+}
+
+/* [android-port] The back end takes extended batches (Nv2aBatchEx). */
+static int backend_ex(void)
+{
+    return s_backend && s_backend->draw_ex;
 }
 
 static void current_surface(Nv2aSurface *out)
@@ -806,6 +812,19 @@ static void current_surface(Nv2aSurface *out)
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+}
+
+/* [android-port] The surface with its format, for draw_ex/clear_ex. */
+static void current_surface_ex(Nv2aSurfaceEx *o)
+{
+    current_surface(&o->base);
+    o->clip_x       = s_gpu.clip_x;
+    o->clip_y       = s_gpu.clip_y;
+    o->color_format = s_gpu.format & 0xF;
+    o->zeta_format  = (s_gpu.format >> 4) & 0xF;
+    o->swizzled     = ((s_gpu.format >> 8) & 0xF) == 2;
+    o->swz_width    = o->swizzled ? 1u << ((s_gpu.format >> 16) & 0xF) : 0;
+    o->swz_height   = o->swizzled ? 1u << ((s_gpu.format >> 24) & 0xF) : 0;
 }
 
 /* Render state in the NV2A's own values, gathered from what the executor
@@ -904,16 +923,39 @@ static void clear_surface(uint32_t param)
 
     /* A back end clears colour and/or depth/stencil itself (flags are the
      * CLEAR_SURFACE bits: Z 0x1, stencil 0x2, colour 0xF0). */
-    if (s_backend && s_backend->clear) {
+    if (s_backend && (s_backend->clear || s_backend->clear_ex)) {
         Nv2aSurface surf;
         Nv2aRenderState rs;
 
         if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
             return;
-        current_surface(&surf);
         current_render_state(&rs);
-        s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
-                         s_gpu.zstencil_clear);
+        if (s_backend->clear_ex) {
+            /* [android-port] The rectangle the CPU path below clears: the
+             * clip, or on a swizzled surface CLEAR_RECT bounded by its size. */
+            Nv2aSurfaceEx sx;
+            uint32_t rect[4];
+
+            current_surface_ex(&sx);
+            rect[0] = s_gpu.clip_x;  rect[2] = s_gpu.clip_x + s_gpu.clip_w;
+            rect[1] = s_gpu.clip_y;  rect[3] = s_gpu.clip_y + s_gpu.clip_h;
+            if (sx.swizzled) {
+                if ((s_gpu.clear_rect_set & 3) == 3) {
+                    rect[0] = s_gpu.clear_rect_h & 0xFFFF;
+                    rect[2] = (s_gpu.clear_rect_h >> 16) + 1;
+                    rect[1] = s_gpu.clear_rect_v & 0xFFFF;
+                    rect[3] = (s_gpu.clear_rect_v >> 16) + 1;
+                }
+                if (rect[2] > sx.swz_width)  rect[2] = sx.swz_width;
+                if (rect[3] > sx.swz_height) rect[3] = sx.swz_height;
+            }
+            s_backend->clear_ex(&sx, &rs, param, s_gpu.clear_color,
+                                s_gpu.zstencil_clear, rect);
+        } else {
+            current_surface(&surf);
+            s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
+                             s_gpu.zstencil_clear);
+        }
         s_gpu.clears++;
         return;
     }
@@ -1342,6 +1384,53 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
 {
     return sample_tex(&s_gpu.texs[0], 0, u, v, argb);
+}
+
+/* [android-port] nv2a_backend.h: one face of a stage, palette included. */
+int nv2a_backend_decode_stage(const Nv2aStage *st, uint32_t face,
+                              uint32_t *argb_out)
+{
+    Texture t;
+    uint32_t x, y, face_off;
+
+    memset(&t, 0, sizeof t);
+    t.offset  = st->tex.offset;
+    t.width   = st->tex.width;
+    t.height  = st->tex.height;
+    t.pitch   = st->tex.pitch;
+    t.color   = st->tex.color;
+    t.addr_u  = t.addr_v = 3;               /* every texel in range */
+    t.palette = st->palette;
+    t.levels  = 1;
+    tex_update_valid(&t);
+    if (!t.valid || face > 5)
+        return 0;
+    face_off = st->cube ? face * st->face_stride : 0;
+    for (y = 0; y < t.height; y++)
+        for (x = 0; x < t.width; x++)
+            if (!sample_tex(&t, face_off, x, y, &argb_out[(size_t)y * t.width + x]))
+                return 0;
+    return 1;
+}
+
+static uint32_t tex_texel_bytes(uint32_t fmt);
+
+/* [android-port] nv2a_backend.h: the guest bytes a stage's level 0 spans
+ * (every face of a cube map), from tex.offset. */
+uint32_t nv2a_backend_stage_bytes(const Nv2aStage *st)
+{
+    uint32_t w = st->tex.width, h = st->tex.height, fmt = st->tex.color;
+    uint32_t block = d3d8_format_dxt_block_bytes(fmt), level0;
+
+    if (!st->valid || !w || !h)
+        return 0;
+    if (!tex_size_from_format(fmt))
+        level0 = st->tex.pitch * h;
+    else if (block)
+        level0 = ((w + 3) / 4) * ((h + 3) / 4) * block;
+    else
+        level0 = w * h * tex_texel_bytes(fmt);
+    return st->cube ? st->face_stride * 5 + level0 : level0;
 }
 
 /* Write a bound texture out as a BMP, through the sampler rather than around it.
@@ -2168,6 +2257,55 @@ static Nv2aVertex *backend_slot(void)
     return &s_bverts[s_bcount];
 }
 
+/* [android-port] The same triangles for draw_ex, as Nv2aVertexEx: grown on
+ * demand (a full batch would be 22 MB), sharing s_bcount and the cap. */
+static Nv2aVertexEx *s_bvx;
+static uint32_t      s_bvx_cap;
+
+static Nv2aVertexEx *backend_slot_ex(void)
+{
+    if (s_bcount + 3 > NV_BACKEND_MAX_VERTS)
+        return NULL;
+    if (s_bcount + 3 > s_bvx_cap) {
+        uint32_t cap = s_bvx_cap ? s_bvx_cap * 2 : 3072;
+        Nv2aVertexEx *n;
+        while (cap < s_bcount + 3)
+            cap *= 2;
+        if (cap > NV_BACKEND_MAX_VERTS)
+            cap = NV_BACKEND_MAX_VERTS;
+        n = (Nv2aVertexEx *)realloc(s_bvx, (size_t)cap * sizeof *n);
+        if (!n)
+            return NULL;
+        s_bvx = n;
+        s_bvx_cap = cap;
+    }
+    return &s_bvx[s_bcount];
+}
+
+static uint32_t tex_face_stride(const Texture *t);
+
+static void stage_ex(int st, Nv2aStage *o)
+{
+    const Texture *t = &s_gpu.texs[st];
+
+    memset(o, 0, sizeof *o);
+    o->tex.offset = t->offset;
+    o->tex.width  = t->width;
+    o->tex.height = t->height;
+    o->tex.pitch  = t->pitch;
+    o->tex.color  = t->color;
+    o->tex.addr_u = t->addr_u;
+    o->tex.addr_v = t->addr_v;
+    o->tex.levels = t->pitch ? 1 : t->levels;
+    o->tex.filter = t->filter;
+    o->valid        = (uint32_t)t->valid;
+    o->palette      = t->palette;
+    o->border       = t->border;
+    o->border_color = (uint32_t)t->border_color;
+    o->cube         = (uint32_t)t->cube;
+    o->face_stride  = t->cube ? tex_face_stride(t) : 0;
+}
+
 static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
 {
     float su = 1.0f, sv = 1.0f;
@@ -2196,6 +2334,34 @@ static void backend_flush(int textured)
 
     if (!s_bcount)
         return;
+    if (backend_ex()) {
+        /* [android-port] Everything xf_rows reads, for the whole batch. */
+        static int no_rc = -1;
+        Nv2aSurfaceEx sx;
+        Nv2aBatchEx bx;
+        int st;
+
+        if (no_rc < 0)
+            no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+        current_surface_ex(&sx);
+        current_render_state(&rs);
+        memset(&bx, 0, sizeof bx);
+        bx.vertices = s_bvx;
+        bx.count = s_bcount;
+        bx.state = &rs;
+        for (st = 0; st < 4; st++)
+            stage_ex(st, &bx.stages[st]);
+        bx.combiner = s_gpu.rc;
+        bx.use_rc = s_gpu.rc_seen && !no_rc;
+        bx.textured = textured && s_gpu.texs[0].valid;
+        bx.fog_color = s_gpu.fog_color;
+        bx.clip_plane_mode = s_gpu.clip_plane_mode;
+        s_backend->draw_ex(&sx, &bx);
+        s_gpu.tris_drawn += s_bcount / 3;
+        s_bcount = 0;
+        note_drawn();
+        return;
+    }
     current_surface(&surf);
     current_render_state(&rs);
     batch.vertices = s_bverts;
@@ -2243,6 +2409,39 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
             && fetch_texcoord(i1, uv[1])
             && fetch_texcoord(i2, uv[2]);
 
+    if (backend_ex()) {
+        /* [android-port] Screen space: w from the vertex's rhw, colour from
+         * its stream, stage 0's coordinate normalised the way a program's
+         * would be (fetch_texcoord gave texels). */
+        Nv2aVertexEx *o = backend_slot_ex();
+        const uint32_t ix[3] = { i0, i1, i2 };
+        float su = 1.0f, sv = 1.0f;
+        int k;
+
+        if (!o)
+            return;
+        if (tex_size_from_format(s_gpu.texs[0].color)) {
+            su = s_gpu.texs[0].width  ? (float)s_gpu.texs[0].width  : 1.0f;
+            sv = s_gpu.texs[0].height ? (float)s_gpu.texs[0].height : 1.0f;
+        }
+        memset(o, 0, 3 * sizeof *o);
+        for (k = 0; k < 3; k++) {
+            float rhw = p[k][3];
+            o[k].pos[0] = p[k][0];
+            o[k].pos[1] = p[k][1];
+            o[k].pos[2] = p[k][2];
+            o[k].pos[3] = (rhw > 1e-20f && rhw < 1e20f) ? 1.0f / rhw : 1.0f;
+            nv2a_rc_unpack(vertex_color(ix[k]), o[k].d0);
+            o[k].fog = 1.0f;
+            if (textured) {
+                o[k].tex[0][0] = uv[k][0] / su;
+                o[k].tex[0][1] = uv[k][1] / sv;
+                o[k].tex[0][3] = 1.0f;
+            }
+        }
+        s_bcount += 3;
+        return;
+    }
     if (backend_draws()) {                 /* a back end rasterises */
         Nv2aVertex *o = backend_slot();
         const uint32_t ix[3] = { i0, i1, i2 };
@@ -3066,6 +3265,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
     if (area == 0.0f || area != area) {
         s_gpu.xf_degenerate++;
+        return;
+    }
+    if (backend_ex()) {                        /* [android-port] */
+        Nv2aVertexEx *o = backend_slot_ex();
+        if (o) {
+            for (k = 0; k < 3; k++) {
+                memcpy(o[k].pos, v[k]->pos, sizeof o[k].pos);
+                memcpy(o[k].d0, v[k]->d0, sizeof o[k].d0);
+                memcpy(o[k].d1, v[k]->d1, sizeof o[k].d1);
+                o[k].fog = fog_factor(v[k]->fog[0]);
+                memcpy(o[k].tex, v[k]->tex, sizeof o[k].tex);
+            }
+            s_bcount += 3;
+        }
         return;
     }
     if (backend_draws()) {                     /* a back end rasterises */

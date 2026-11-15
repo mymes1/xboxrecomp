@@ -20,14 +20,19 @@
  * so a back end only ever sees surface pixels. Blend, depth, alpha, cull and
  * stencil state arrive in Nv2aRenderState.
  *
- * ponytail: register-combiner state and texture stages 1-3 are not passed on:
- * a back end sees stage 0 and the diffuse colour. Extend Nv2aBatch when that
- * matters rather than adding callbacks.
+ * draw() sees stage 0 and the diffuse colour only. [android-port] A back end
+ * that runs the whole pixel pipeline -- register combiners, four texture
+ * stages, specular, fog, alpha test -- sets draw_ex instead: Nv2aBatchEx
+ * carries every per-vertex value the executor's own rasteriser interpolates
+ * and the per-batch state it reads (see "Extended batches" below). clear_ex
+ * likewise gets the surface's format and the exact rectangle the CPU path
+ * clears. A back end sets either form or both; the extended one wins.
  */
 #ifndef NV2A_BACKEND_H
 #define NV2A_BACKEND_H
 
 #include <stdint.h>
+#include "nv2a_combiner.h"      /* Nv2aCombiner, for Nv2aBatchEx */
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
@@ -89,6 +94,62 @@ typedef struct {
     const Nv2aRenderState *state;
 } Nv2aBatch;
 
+/* ---- Extended batches [android-port] ---------------------------------
+ *
+ * What the executor's own rasteriser (xf_rows in nv2a_pb_exec.c) works from,
+ * so a GPU back end can produce the same pixels: */
+
+/* The colour surface with its format. base is what draw() gets. */
+typedef struct {
+    Nv2aSurface base;
+    uint32_t clip_x, clip_y;        /* clip origin, real pixels */
+    uint32_t color_format;          /* SET_SURFACE_FORMAT bits 0-3 */
+    uint32_t zeta_format;           /* bits 4-7: 1 Z16, 2 Z24S8 (depth range) */
+    uint32_t swizzled;              /* type 2: pixels in Morton order */
+    uint32_t swz_width, swz_height; /* that surface's size, when swizzled */
+} Nv2aSurfaceEx;
+
+/* One vertex. pos: x, y in real surface pixels, z the window z as the title
+ * produced it (compared as it is; see docs/technical/pushbuffer-executor.md),
+ * w the clip-space w (perspective-correct texturing; 1/rhw for a
+ * pre-transformed vertex). Colours are r, g, b, a in [0,1] and interpolate
+ * linearly in screen space, as the CPU rasteriser does; fog is the fog
+ * unit's factor (1 = no fog). tex: stage s's s, t, r, q as the vertex
+ * program wrote them -- normalised for swizzled and DXT textures, texels for
+ * linear ones (Nv2aStage.tex.pitch != 0) -- interpolated perspective-correct. */
+typedef struct {
+    float pos[4];
+    float d0[4], d1[4];
+    float fog;
+    float tex[4][4];
+} Nv2aVertexEx;
+
+/* A texture stage as programmed. tex.levels/filter as in Nv2aTexture. */
+typedef struct {
+    Nv2aTexture tex;
+    uint32_t valid;                 /* the stage can be sampled */
+    uint32_t palette;               /* guest address of the CLUT (P8), or 0 */
+    uint32_t border;                /* SET_TEXTURE_BORDER_COLOR, 0xAARRGGBB */
+    uint32_t border_color;          /* FORMAT: address mode 4 reads `border` */
+    uint32_t cube;                  /* six faces of face_stride bytes each */
+    uint32_t face_stride;
+} Nv2aStage;
+
+/* The combiners decide each pixel when use_rc is set; otherwise the pixel is
+ * d0, times stage 0's texel when `textured` -- exactly the executor's two
+ * paths. A stage contributes when combiner.stage_program says so (5 bits a
+ * stage). Fog colour as sent: R in bits 0-7. */
+typedef struct {
+    const Nv2aVertexEx    *vertices; /* triangle list */
+    uint32_t               count;
+    const Nv2aRenderState *state;
+    Nv2aStage              stages[4];
+    Nv2aCombiner           combiner;
+    uint32_t               use_rc, textured;
+    uint32_t               fog_color;
+    uint32_t               clip_plane_mode;     /* SET_SHADER_CLIP_PLANE_MODE */
+} Nv2aBatchEx;
+
 typedef struct {
     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
      * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
@@ -96,6 +157,13 @@ typedef struct {
                   uint32_t flags, uint32_t argb, uint32_t zstencil);
     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
     void (*flip)(void);
+    /* [android-port] Optional; when set they are called instead of draw and
+     * clear. rect: x0, y0, x1, y1 (exclusive), real pixels -- the surface
+     * clip, or CLEAR_RECT on a swizzled surface, as the CPU path clears. */
+    void (*draw_ex)(const Nv2aSurfaceEx *s, const Nv2aBatchEx *b);
+    void (*clear_ex)(const Nv2aSurfaceEx *s, const Nv2aRenderState *rs,
+                     uint32_t flags, uint32_t argb, uint32_t zstencil,
+                     const uint32_t rect[4]);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
@@ -116,6 +184,19 @@ void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
  * Handles every format the executor can sample (swizzled, linear, DXT).
  * Returns 0 if the format is not supported. */
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+
+/* [android-port] Decode one face of a stage's level 0 to 0xAARRGGBB, as the
+ * executor samples it: every format nv2a_backend_decode_texture handles,
+ * plus palettised textures (the stage's CLUT) and cube faces (face 0-5).
+ * Returns 0 if the format is not supported. */
+int nv2a_backend_decode_stage(const Nv2aStage *stage, uint32_t face,
+                              uint32_t *argb_out);
+
+/* [android-port] How many guest bytes a stage's level 0 spans from
+ * tex.offset, every face included: what a back end hashes to notice a
+ * rewritten texture, and compares with surfaces it has drawn into. 0 for a
+ * stage that cannot be sampled. */
+uint32_t nv2a_backend_stage_bytes(const Nv2aStage *stage);
 
 /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
  * of the semaphore the title reads GPU progress from (for XDK D3D, the
