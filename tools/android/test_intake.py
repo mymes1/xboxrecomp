@@ -7,11 +7,13 @@ No game content: images are written by xiso_build from generated files.
 
 import hashlib
 import http.server
+import json
 import os
 import struct
 import tempfile
 import threading
 import unittest
+import zipfile
 
 from tools.android import iso, xiso_build
 from tools.xiso.xdvdfs import Xiso, SECTOR
@@ -27,6 +29,32 @@ def _tree(root, files):
 
 def _sha(path):
     return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+def _sha1(path):
+    return hashlib.sha1(open(path, "rb").read()).hexdigest()
+
+
+class _Server:
+    """A local HTTP server for a directory (no network in the tests)."""
+
+    def __init__(self, directory):
+        class H(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **k):
+                super().__init__(*a, directory=directory, **k)
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.base = "http://127.0.0.1:%d" % self.srv.server_address[1]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.srv.shutdown()
 
 
 FILES = {
@@ -98,6 +126,7 @@ class Intake(unittest.TestCase):
         self.img = os.path.join(self.dir, "game.iso")
         xiso_build.build(src, self.img)
         self.sha = _sha(self.img)
+        self.sha1 = _sha1(self.img)
         self.logs = []
 
     def tearDown(self):
@@ -123,6 +152,121 @@ class Intake(unittest.TestCase):
     def test_bad_hash_syntax_rejected(self):
         with self.assertRaises(iso.IsoError):
             iso.acquire(self.img, os.path.join(self.dir, "in"), "abc", log=self.log)
+
+    def test_every_image_records_both_digests(self):
+        info = iso.acquire(self.img, os.path.join(self.dir, "in"), None, log=self.log)
+        self.assertEqual((info["sha256"], info["sha1"]), (self.sha, self.sha1))
+        self.assertEqual(info["verified_with"], [])
+        self.assertTrue(any(self.sha1 in m for m in self.logs))
+
+    def test_sha1_alone_verifies(self):
+        info = iso.acquire(self.img, os.path.join(self.dir, "in"), expected_sha1=self.sha1,
+                           log=self.log)
+        self.assertTrue(info["verified"])
+        self.assertEqual(info["verified_with"], ["sha1"])
+        self.assertEqual(info["matched"], "image")
+        self.assertEqual(_sha(info["path"]), self.sha)
+        self.assertTrue(any(m.startswith("verified: SHA-1") for m in self.logs))
+
+    def test_sha1_mismatch_fails_and_places_nothing(self):
+        out = os.path.join(self.dir, "in")
+        with self.assertRaises(iso.IsoError) as cm:
+            iso.acquire(self.img, out, expected_sha1="0" * 40, log=self.log)
+        self.assertIn("SHA-1 expected " + "0" * 40, str(cm.exception))
+        self.assertIn(self.sha1, str(cm.exception))
+        self.assertFalse(os.path.lexists(os.path.join(out, "disc.iso")))
+
+    def test_both_digests_given_both_must_match(self):
+        info = iso.acquire(self.img, os.path.join(self.dir, "a"), self.sha,
+                           expected_sha1=self.sha1, log=self.log)
+        self.assertEqual(info["verified_with"], ["sha256", "sha1"])
+        with self.assertRaises(iso.IsoError) as cm:
+            iso.acquire(self.img, os.path.join(self.dir, "b"), self.sha,
+                        expected_sha1="0" * 40, log=self.log)
+        self.assertIn("SHA-1", str(cm.exception))
+        self.assertNotIn("SHA-256", str(cm.exception))      # only what failed
+        with self.assertRaises(iso.IsoError):
+            iso.acquire(self.img, os.path.join(self.dir, "c"), "0" * 64,
+                        expected_sha1=self.sha1, log=self.log)
+
+    def test_digest_spellings(self):
+        n = iso.normalise_digest
+        self.assertEqual(n("  SHA-1:%s \n" % self.sha1.upper(), "sha1"), self.sha1)
+        self.assertEqual(n("sha1:" + self.sha1, "sha1"), self.sha1)
+        self.assertEqual(n("SHA256: " + self.sha, "sha256"), self.sha)
+        self.assertIsNone(n(None, "sha1"))
+        self.assertIsNone(n("   ", "sha1"))
+        self.assertEqual(iso.expected_digests(self.sha, ""), {"sha256": self.sha})
+        with self.assertRaises(iso.IsoError):
+            n("sha256:" + self.sha, "sha1")                  # labelled as the other one
+        with self.assertRaises(iso.IsoError):
+            n("g" * 40, "sha1")
+        with self.assertRaises(iso.IsoError):
+            n(self.sha1[:-1], "sha1")
+
+    def test_sha1_given_as_sha256_says_so(self):
+        with self.assertRaises(iso.IsoError) as cm:
+            iso.acquire(self.img, os.path.join(self.dir, "in"), self.sha1, log=self.log)
+        self.assertIn("SHA-1 digest", str(cm.exception))
+        self.assertIn("--sha1", str(cm.exception))
+        with self.assertRaises(iso.IsoError) as cm:
+            iso.acquire(self.img, os.path.join(self.dir, "in"), expected_sha1=self.sha,
+                        log=self.log)
+        self.assertIn("--sha256", str(cm.exception))
+
+    def test_zip_verified_by_the_image_inside_or_by_the_zip(self):
+        z = os.path.join(self.dir, "Game (USA).zip")
+        with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(self.img, "Game (USA).iso")
+        # Disc databases list the image's digest, not the archive's.
+        info = iso.acquire(z, os.path.join(self.dir, "a"), expected_sha1=self.sha1, log=self.log)
+        self.assertEqual(info["matched"], "image")
+        self.assertEqual((info["sha256"], info["sha1"]), (self.sha, self.sha1))
+        self.assertEqual(info["container"], {"sha256": _sha(z), "sha1": _sha1(z)})
+        self.assertEqual(_sha(info["path"]), self.sha)
+        info = iso.acquire(z, os.path.join(self.dir, "b"), _sha(z), expected_sha1=_sha1(z),
+                           log=self.log)
+        self.assertEqual(info["matched"], "container")
+        # Mixed (one digest of each) is not a match for either file.
+        with self.assertRaises(iso.IsoError):
+            iso.acquire(z, os.path.join(self.dir, "c"), _sha(z), expected_sha1=self.sha1,
+                        log=self.log)
+        with self.assertRaises(iso.IsoError) as cm:
+            iso.acquire(z, os.path.join(self.dir, "d"), expected_sha1="1" * 40, log=self.log)
+        self.assertIn("image in the zip " + self.sha1, str(cm.exception))
+        self.assertFalse(os.path.lexists(os.path.join(self.dir, "c", "disc.iso")))
+        self.assertFalse(os.path.lexists(os.path.join(self.dir, "d", "disc.iso")))
+
+    def test_broken_zip_is_an_intake_error(self):
+        z = os.path.join(self.dir, "broken.zip")
+        with open(z, "wb") as f:
+            f.write(b"PK\x03\x04 not really a zip")
+        with self.assertRaises(iso.IsoError):
+            iso.acquire(z, os.path.join(self.dir, "in"), None, log=self.log)
+
+    def test_rerun_on_the_placed_copy_keeps_it(self):
+        out = os.path.join(self.dir, "in")
+        iso.acquire(self.img, out, None, log=self.log, link_local=False)
+        placed = os.path.join(out, "disc.iso")
+        info = iso.acquire(placed, out, expected_sha1=self.sha1, log=self.log)
+        self.assertTrue(info["verified"])
+        self.assertEqual(_sha(placed), self.sha)
+
+    def test_url_zip_without_suffix_verified_by_sha1(self):
+        serve = os.path.join(self.dir, "srv")
+        os.makedirs(serve)
+        with zipfile.ZipFile(os.path.join(serve, "download"), "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(self.img, "game.iso")
+        with _Server(serve) as srv:
+            url = srv.base + "/download?id=1234"
+            info = iso.acquire(url, os.path.join(self.dir, "dl"), expected_sha1=self.sha1,
+                               log=self.log)
+            self.assertEqual(info["matched"], "image")
+            self.assertEqual(_sha(info["path"]), self.sha)
+            out = os.path.join(self.dir, "dl2")
+            with self.assertRaises(iso.IsoError):
+                iso.acquire(url, out, expected_sha1="2" * 40, log=self.log)
+            self.assertFalse([f for f in os.listdir(out) if f.endswith(".part") or f == "disc.iso"])
 
     def test_url_download_verifies_and_redacts(self):
         directory = self.dir
@@ -199,6 +343,49 @@ class Intake(unittest.TestCase):
         with self.assertRaises(iso.IsoError) as cm:
             iso.find_default_xbe(d)
         self.assertIn("other.xbe", str(cm.exception))
+
+
+class PipelineIntakeFlags(unittest.TestCase):
+    """--sha1 / --sha256 through the pipeline's intake stage (no zig needed)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        src = os.path.join(self.tmp.name, "src")
+        _tree(src, FILES)
+        self.img = os.path.join(self.tmp.name, "game.iso")
+        xiso_build.build(src, self.img)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, work, *flags):
+        from tools.android import pipeline
+        return pipeline.main(["run", "--work", work, "--source", self.img, "--only", "intake",
+                              *flags])
+
+    def _json(self, *p):
+        with open(os.path.join(*p), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_sha1_flag_verifies_and_is_reported(self):
+        work = os.path.join(self.tmp.name, "w")
+        self.assertEqual(self._run(work, "--sha1", _sha1(self.img)), 0)
+        img = self._json(work, "reports", "intake.json")["image"]
+        self.assertTrue(img["verified"])
+        self.assertEqual(img["verified_with"], ["sha1"])
+        self.assertEqual((img["sha256"], img["sha1"]), (_sha(self.img), _sha1(self.img)))
+        result = self._json(work, "pipeline_state.json")["stages"]["intake"]["result"]
+        self.assertEqual(result["image_sha1"], _sha1(self.img))
+        from tools.android import compat
+        md = compat.to_markdown(compat.build(work))
+        self.assertIn("verified against the supplied SHA-1 of the image", md)
+
+    def test_sha1_flag_mismatch_fails_the_stage(self):
+        work = os.path.join(self.tmp.name, "w")
+        self.assertEqual(self._run(work, "--sha256", _sha(self.img), "--sha1", "3" * 40), 1)
+        st = self._json(work, "pipeline_state.json")["stages"]["intake"]
+        self.assertEqual(st["status"], "failed")
+        self.assertIn("SHA-1 expected " + "3" * 40, st["error"])
 
 
 if __name__ == "__main__":

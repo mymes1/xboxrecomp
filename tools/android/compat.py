@@ -48,6 +48,7 @@ def build(work):
     check = _load(os.path.join(rep, "native_check.json"))
     host_build = _load(os.path.join(rep, "host_build.json"))
     host_run = _load(os.path.join(rep, "host_runtime.json"))
+    intake = _load(os.path.join(rep, "intake.json"))
     evidence = {}
     level = None
     if xbe and not xbe.get("problems"):
@@ -82,6 +83,9 @@ def build(work):
         "title": (xbe or {}).get("title"),
         "title_id": (xbe or {}).get("title_id"),
         "xbe_sha256": (xbe or {}).get("sha256"),
+        # The disc image the title came from, and which supplied digest
+        # (SHA-256, SHA-1 or none) it was checked against at intake.
+        "image": (intake or {}).get("image"),
         "level": level,
         "levels": LEVELS,
         "evidence": evidence,
@@ -124,6 +128,19 @@ def _host_summary(r):
     return out
 
 
+def _image_line(img):
+    if not img:
+        return "Disc image: no intake record."
+    line = "Disc image SHA-256 `%s`, SHA-1 %s: " % (
+        img.get("sha256"), "`%s`" % img["sha1"] if img.get("sha1") else "not recorded")
+    if not img.get("verified"):
+        return line + "**unverified** (no expected digest was given)."
+    names = {"sha256": "SHA-256", "sha1": "SHA-1"}
+    return line + "verified against the supplied %s of the %s." % (
+        " and ".join(names.get(a, a) for a in img.get("verified_with") or []),
+        "zip it came in" if img.get("matched") == "container" else "image")
+
+
 def to_markdown(r):
     out = ["# Compatibility report: %s" % (r.get("title") or "unknown title"), ""]
     out.append("**Highest level with evidence: %s**" % (r["level"] or "none"))
@@ -132,7 +149,8 @@ def to_markdown(r):
     out.append("|---|---|")
     for lv in r["levels"]:
         out.append("| %s | %s |" % (lv, r["evidence"].get(lv, "—")))
-    out += ["", "Title ID `%s`, default.xbe SHA-256 `%s`." % (r.get("title_id"), r.get("xbe_sha256")), ""]
+    out += ["", "Title ID `%s`, default.xbe SHA-256 `%s`." % (r.get("title_id"), r.get("xbe_sha256"))]
+    out += [_image_line(r.get("image")), ""]
     x = r["xbe"]
     if x["problems"] or x["warnings"]:
         out.append("## XBE findings")

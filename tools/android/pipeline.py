@@ -1,7 +1,7 @@
 """Original Xbox disc image -> Android APK, one stage at a time.
 
     python3 -m tools.android.pipeline run --source game.iso --sha256 <hex> --work build/games/x
-    python3 -m tools.android.pipeline run --source https://... --sha256 <hex> --work ...
+    python3 -m tools.android.pipeline run --source https://... --sha1 <hex> --work ...
     python3 -m tools.android.pipeline run --work build/games/x --from recompile
     python3 -m tools.android.pipeline status --work build/games/x
 
@@ -9,7 +9,8 @@ Stages, in order (each records its result in <work>/pipeline_state.json and
 its log in <work>/reports/logs/<stage>.log; a failed stage stops the run and
 says why):
 
-  intake     acquire the user's image, verify SHA-256, detect XDVDFS, extract
+  intake     acquire the user's image, verify it (--sha256 and/or --sha1: of
+             the image, or of the .zip it comes in), detect XDVDFS, extract
              every file into <work>/game with a manifest, locate default.xbe
   analyze    toolkit XBE parser + structured analysis (sections, imports,
              libraries, certificate, title image) -> reports/xbe_analysis.*
@@ -116,10 +117,16 @@ def stage_intake(ctx):
     a = ctx.args
     if not a.source:
         raise StageError("--source is required for intake (a path or URL to your disc image)")
-    info = iso.acquire(a.source, ctx.path("input"), a.sha256, log=ctx.log)
-    ctx.log("image: %s, %d bytes, sha256 %s (%s)" % (
-        info["source"], info["size"], info["sha256"],
-        "verified" if info["verified"] else "UNVERIFIED: no expected hash given"))
+    info = iso.acquire(a.source, ctx.path("input"), a.sha256, log=ctx.log,
+                       expected_sha1=a.sha1)
+    if info["verified"]:
+        how = "verified by %s of the %s" % (
+            " and ".join(iso.HASHES[h][0] for h in info["verified_with"]),
+            "zip" if info["matched"] == "container" else "image")
+    else:
+        how = "UNVERIFIED: no expected hash given"
+    ctx.log("image: %s, %d bytes, sha256 %s, sha1 %s (%s)" % (
+        info["source"], info["size"], info["sha256"], info["sha1"], how))
     det = iso.detect(info["path"])
     ctx.log("format: %s at partition base 0x%X" % (det["layout"], det["partition_base"]))
     game = ctx.path("game")
@@ -128,7 +135,8 @@ def stage_intake(ctx):
     manifest = iso.extract(info["path"], game, log=ctx.log)
     xbe = iso.find_default_xbe(game)
     manifest["default_xbe"] = os.path.relpath(xbe, game)
-    manifest["image"] = {k: info[k] for k in ("sha256", "size", "source", "verified")}
+    manifest["image"] = {k: info[k] for k in ("sha256", "sha1", "size", "source", "verified",
+                                              "verified_with", "matched", "container")}
     manifest["detect"] = det
     iso.write_json(ctx.path("game_manifest.json"), manifest)
     iso.write_json(os.path.join(ctx.reports, "intake.json"), {
@@ -136,7 +144,8 @@ def stage_intake(ctx):
         "total_bytes": manifest["total_bytes"], "default_xbe": manifest["default_xbe"]})
     return {"default_xbe": manifest["default_xbe"], "files": manifest["file_count"],
             "bytes": manifest["total_bytes"], "image_sha256": info["sha256"],
-            "verified": info["verified"]}
+            "image_sha1": info["sha1"], "verified": info["verified"],
+            "verified_with": info["verified_with"]}
 
 
 def _game_xbe(ctx):
@@ -363,7 +372,10 @@ def main(argv=None):
     r = sub.add_parser("run", help="run stages")
     r.add_argument("--work", required=True, help="per-game work directory")
     r.add_argument("--source", help="disc image: a path, file:// or http(s):// URL")
-    r.add_argument("--sha256", help="expected SHA-256 of the image (strongly recommended)")
+    r.add_argument("--sha256", help="expected SHA-256 of the image, or of the .zip it comes in"
+                                    " (strongly recommended)")
+    r.add_argument("--sha1", help="expected SHA-1 of the image or its .zip, as disc databases"
+                                  " such as Redump list it; with --sha256 both must match")
     r.add_argument("--from", dest="start", choices=STAGES, default="intake")
     r.add_argument("--to", dest="stop", choices=STAGES, default="verify")
     r.add_argument("--only", choices=STAGES)

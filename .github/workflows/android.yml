@@ -2,8 +2,9 @@ name: Android pipeline
 
 # Original Xbox disc image -> Android arm64-v8a, on the self-built test title
 # (no game content; tools/android/testtitle) on every push, and on a disc
-# image YOU provide when started by hand (workflow_dispatch: iso_url +
-# iso_sha256, or the XBR_ISO_URL / XBR_ISO_SHA256 repository secrets).
+# image YOU provide when started by hand (workflow_dispatch: iso_url with
+# iso_sha256 and/or iso_sha1, or the XBR_ISO_URL secret with XBR_ISO_SHA256
+# and/or XBR_ISO_SHA1). SHA-1 is what disc databases such as Redump list.
 #
 # Each job publishes its result as a check run (tools/android/ci_report.py)
 # and uploads the work directory's reports and native libraries.
@@ -33,7 +34,11 @@ on:
         required: false
         default: ""
       iso_sha256:
-        description: "SHA-256 of that image (required with iso_url)"
+        description: "SHA-256 of that image, or of the .zip it is in. With iso_url, give this, iso_sha1, or both."
+        required: false
+        default: ""
+      iso_sha1:
+        description: "SHA-1 of that image or its .zip (as Redump lists it). When both digests are given, both must match."
         required: false
         default: ""
       upload_apk:
@@ -243,20 +248,33 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 300
+    # The inputs and the secrets each describe one image, so they are used
+    # as sets: with iso_url given, the digests come from the inputs only,
+    # never from secrets that may belong to a different image.
     env:
-      ISO_URL: ${{ inputs.iso_url != '' && inputs.iso_url || secrets.XBR_ISO_URL }}
-      ISO_SHA256: ${{ inputs.iso_sha256 != '' && inputs.iso_sha256 || secrets.XBR_ISO_SHA256 }}
+      IN_URL: ${{ inputs.iso_url }}
+      IN_SHA256: ${{ inputs.iso_sha256 }}
+      IN_SHA1: ${{ inputs.iso_sha1 }}
+      SECRET_URL: ${{ secrets.XBR_ISO_URL }}
+      SECRET_SHA256: ${{ secrets.XBR_ISO_SHA256 }}
+      SECRET_SHA1: ${{ secrets.XBR_ISO_SHA1 }}
     steps:
       - name: Image source
         id: src
         run: |
-          if [ -z "$ISO_URL" ]; then
+          if [ -n "$IN_URL" ]; then
+            url=$IN_URL sha256=$IN_SHA256 sha1=$IN_SHA1 from="workflow inputs"
+          else
+            url=$SECRET_URL sha256=$SECRET_SHA256 sha1=$SECRET_SHA1 from="repository secrets"
+          fi
+          if [ -z "$url" ]; then
             echo "No disc image given (iso_url input or XBR_ISO_URL secret); nothing to do."
             echo "have=0" >> "$GITHUB_OUTPUT"
-          elif [ -z "$ISO_SHA256" ]; then
-            echo "::error::an image URL needs its SHA-256 (iso_sha256 input or XBR_ISO_SHA256 secret)"
+          elif [ -z "$sha256" ] && [ -z "$sha1" ]; then
+            echo "::error::an image URL needs its SHA-256 or SHA-1 (iso_sha256 / iso_sha1 inputs, or the XBR_ISO_SHA256 / XBR_ISO_SHA1 secrets)"
             exit 1
           else
+            echo "Image from the $from; expected digests: ${sha256:+SHA-256 }${sha1:+SHA-1}"
             echo "have=1" >> "$GITHUB_OUTPUT"
           fi
 
@@ -284,8 +302,16 @@ jobs:
         env:
           JAVA_HOME: ${{ env.JAVA_HOME_17_X64 }}
         run: |
+          if [ -n "$IN_URL" ]; then
+            url=$IN_URL sha256=$IN_SHA256 sha1=$IN_SHA1
+          else
+            url=$SECRET_URL sha256=$SECRET_SHA256 sha1=$SECRET_SHA1
+          fi
+          digests=()
+          if [ -n "$sha256" ]; then digests+=(--sha256 "$sha256"); fi
+          if [ -n "$sha1" ]; then digests+=(--sha1 "$sha1"); fi
           want=$(python3 -c "import json;print(json.load(open('tools/android/deps.lock.json'))['android']['ndk']['revision'])")
-          python3 -m tools.android.pipeline run --source "$ISO_URL" --sha256 "$ISO_SHA256" \
+          python3 -m tools.android.pipeline run --source "$url" "${digests[@]}" \
             --work build/games/user --to verify --native-mode ndk --ndk "$ANDROID_HOME/ndk/$want" \
             --host-seconds 60
 

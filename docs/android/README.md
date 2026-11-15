@@ -49,8 +49,42 @@ Compatibility levels used throughout the reports:
 - [DEPENDENCIES.md](DEPENDENCIES.md) — every pinned input and how it is verified
 - [MODIFICATIONS.md](MODIFICATIONS.md) — every change to upstream files
 
+## Running the pipeline on your disc image
+
+```
+python3 -m tools.android.pipeline run --work build/games/mygame \
+    --source /path/to/game.iso --sha1 <40 hex digits>      # or --sha256 <64 hex digits>
+python3 -m tools.android.pipeline status --work build/games/mygame
+```
+
+`--source` is a path, a `file://` URL or an `http(s)://` URL (credentials in
+the URL are sent as a header and never logged), to an `.iso`/`.xiso` image or
+a `.zip` holding exactly one.
+
+The image is verified at intake against the digests you give:
+
+- `--sha256` and `--sha1` are both accepted. SHA-1 is what disc preservation
+  databases such as Redump list for each dump, so it is often the only
+  reference you have. SHA-256 is the stronger check: use it when you have it.
+- Give either one or both. When both are given, both must match.
+- A digest may be plain hex or labelled (`sha1:…`, `SHA-1:…`); letter case
+  does not matter. A 40-digit value passed as `--sha256`, or a 64-digit value
+  passed as `--sha1`, is refused with a hint to use the other option.
+- For a `.zip`, the digests may be those of the zip or of the image inside
+  it (databases list the image).
+- Without any digest the run continues, but the image is reported as
+  **unverified**. Both of its digests are still recorded in
+  `reports/intake.json` and in the compatibility report.
+
+In GitHub Actions, start *Android pipeline* by hand with `iso_url` plus
+`iso_sha256` and/or `iso_sha1`, or set the `XBR_ISO_URL` repository secret
+with `XBR_ISO_SHA256` and/or `XBR_ISO_SHA1`. The inputs and the secrets are
+each used as a complete set: with `iso_url` given, no digest is taken from
+the secrets.
+
 ## Legal
 
 The pipeline never fetches game content on its own. You supply the disc image
-(a path, or a URL to a copy you are entitled to use, with its SHA-256), and
-the APK it produces contains that title's code and data: do not distribute it.
+(a path, or a URL to a copy you are entitled to use, with its SHA-256 or
+SHA-1), and the APK it produces contains that title's code and data: do not
+distribute it.

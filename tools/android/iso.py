@@ -1,14 +1,21 @@
 """Disc image intake: acquire, verify, detect, extract.
 
-    acquire(source, dest_dir, expected_sha256=None)   path or http(s)/file URL
+    acquire(source, dest_dir, expected_sha256=None, expected_sha1=None)
+                                                      path or http(s)/file URL
     detect(iso_path)                                  is it XDVDFS, and where
     extract(iso_path, out_dir)                        every file, verified
     find_default_xbe(game_dir)                        the title's executable
 
 The pipeline never fetches game content on its own: `source` is what the user
-supplied. A URL download is streamed to disk with its SHA-256 computed on the
-way; when the user gives the expected hash a mismatch deletes the download and
-fails. Without one the computed hash is recorded and reported as unverified.
+supplied. A URL download is streamed to disk with its SHA-256 and SHA-1
+computed on the way (a local file is hashed in one read). The user may give
+either expected digest or both, and every digest given must match; a mismatch
+deletes the download and fails. SHA-1 is accepted because it is what disc
+preservation databases (Redump and the like) list for each dump, so it is
+often the only reference a user has; SHA-256 is preferred when available. An
+image that arrives in a .zip passes when the digests are those of the zip or
+of the image inside it. Without any expected digest both computed digests are
+recorded and the image is reported as unverified.
 
 Extraction uses tools/xiso (pure Python, no external binary). Every file's size
 is checked against its directory entry and every name is checked for path
@@ -36,6 +43,25 @@ class IsoError(Exception):
     pass
 
 
+# Image digests, strongest first: algorithm -> (display name, hex length).
+HASHES = {"sha256": ("SHA-256", 64), "sha1": ("SHA-1", 40)}
+_HEX = frozenset("0123456789abcdef")
+
+
+def _hashers():
+    return {algo: hashlib.new(algo) for algo in HASHES}
+
+
+def _digests(path):
+    """{algo: hex digest} for every algorithm in HASHES, in one read."""
+    hs = _hashers()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            for h in hs.values():
+                h.update(chunk)
+    return {a: h.hexdigest() for a, h in hs.items()}
+
+
 def _sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -44,21 +70,61 @@ def _sha256(path):
     return h.hexdigest()
 
 
-def _normalise_sha(s):
-    if s is None:
+def normalise_digest(value, algo):
+    """A user-supplied digest for `algo` ("sha256" or "sha1"): hex digits,
+    optionally labelled ("sha1:...", "SHA-1:..."); letter case and
+    surrounding blanks do not matter. Returns lower-case hex, or None for
+    None or a blank string. Raises IsoError for anything else, naming the
+    other algorithm when the length is that of its digests."""
+    if value is None or not value.strip():
         return None
-    s = s.strip().lower()
-    if s.startswith("sha256:"):
-        s = s[7:]
-    if len(s) != 64 or any(c not in "0123456789abcdef" for c in s):
-        raise IsoError("expected SHA-256 must be 64 hex digits, got %r" % s)
+    name, length = HASHES[algo]
+    s = value.strip().lower()
+    if ":" in s:
+        label, s = s.split(":", 1)
+        label, s = label.strip().replace("-", ""), s.strip()
+        if label != algo:
+            raise IsoError("expected %s digest, got one labelled %r" % (name, label))
+    if len(s) != length or not set(s) <= _HEX:
+        hint = ""
+        if set(s) <= _HEX:
+            for other, (oname, olen) in HASHES.items():
+                if other != algo and len(s) == olen:
+                    hint = ("; %d hex digits is a %s digest: give it as the %s"
+                            " (--%s, workflow input iso_%s)" % (olen, oname, oname, other, other))
+        raise IsoError("expected %s must be %d hex digits, got %r%s" % (name, length, s, hint))
     return s
 
 
+def expected_digests(sha256=None, sha1=None):
+    """The digests the user supplied, normalised: {algo: hex}, maybe empty."""
+    out = {}
+    for algo, value in (("sha256", sha256), ("sha1", sha1)):
+        d = normalise_digest(value, algo)
+        if d:
+            out[algo] = d
+    return out
+
+
+def _matches(expected, got):
+    return bool(expected) and all(got.get(a) == d for a, d in expected.items())
+
+
+def _mismatch(expected, image, container, what):
+    parts = []
+    for a, d in expected.items():
+        if container:
+            parts.append("%s expected %s, image in the zip %s, zip %s"
+                         % (HASHES[a][0], d, image[a], container[a]))
+        elif image[a] != d:
+            parts.append("%s expected %s, got %s" % (HASHES[a][0], d, image[a]))
+    return "digest mismatch for %s: %s" % (what, "; ".join(parts))
+
+
 def _download(url, dest, log, retries=3, max_bytes=MAX_IMAGE_BYTES):
-    """Stream url to dest; returns (sha256, size). Resumes on retry when the
-    server honours Range."""
-    h = None
+    """Stream url to dest; returns ({algo: hex digest}, size). Resumes on
+    retry when the server honours Range."""
+    hs = None
     got = 0
     last = None
     # urllib does not take credentials from the URL itself: move them into a
@@ -78,15 +144,15 @@ def _download(url, dest, log, retries=3, max_bytes=MAX_IMAGE_BYTES):
             if auth:
                 headers["Authorization"] = auth
             mode = "wb"
-            if got and h is not None:
+            if got and hs is not None:
                 headers["Range"] = "bytes=%d-" % got
                 mode = "ab"
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=120) as r:
                 if mode == "ab" and r.status != 206:
-                    mode, got, h = "wb", 0, None     # no resume: start over
-                if h is None:
-                    h = hashlib.sha256()
+                    mode, got, hs = "wb", 0, None    # no resume: start over
+                if hs is None:
+                    hs = _hashers()
                 total = r.headers.get("Content-Length")
                 log("downloading %s (attempt %d%s)" % (
                     _redact(url), attempt, ", %s bytes" % total if total else ""))
@@ -97,13 +163,14 @@ def _download(url, dest, log, retries=3, max_bytes=MAX_IMAGE_BYTES):
                         got += len(chunk)
                         if got > max_bytes:
                             raise IsoError("download exceeds %d bytes; not a disc image" % max_bytes)
-                        h.update(chunk)
+                        for h in hs.values():
+                            h.update(chunk)
                         out.write(chunk)
                         now = time.time()
                         if now - last_report > 15:
                             log("  %d MB" % (got >> 20))
                             last_report = now
-            return h.hexdigest(), got
+            return {a: h.hexdigest() for a, h in hs.items()}, got
         except IsoError:
             raise
         except Exception as e:      # network: retry (resuming if possible)
@@ -122,8 +189,24 @@ def _redact(url):
     return urllib.parse.urlunsplit((p.scheme, netloc, p.path, "", ""))
 
 
+def _is_zip(path, name=""):
+    """A .zip by name, or by content (a download URL need not end in .zip)."""
+    if name.lower().endswith(".zip"):
+        return True
+    with open(path, "rb") as f:
+        head = f.read(4)
+    return head == b"PK\x03\x04" and zipfile.is_zipfile(path)
+
+
 def _unwrap_zip(path, dest_dir, log):
     """A .zip holding exactly one disc image: extract it, return its path."""
+    try:
+        return _unwrap_zip_inner(path, dest_dir, log)
+    except zipfile.BadZipFile as e:
+        raise IsoError("not a usable zip archive: %s" % e)
+
+
+def _unwrap_zip_inner(path, dest_dir, log):
     with zipfile.ZipFile(path) as z:
         images = [i for i in z.infolist()
                   if not i.is_dir() and i.filename.lower().endswith((".iso", ".xiso"))]
@@ -139,33 +222,33 @@ def _unwrap_zip(path, dest_dir, log):
     return out
 
 
-def acquire(source, dest_dir, expected_sha256=None, log=print, link_local=True):
+def acquire(source, dest_dir, expected_sha256=None, log=print, link_local=True,
+            expected_sha1=None):
     """Bring the user's image into dest_dir/disc.iso and verify it.
 
-    Returns a dict: path, sha256, size, source (redacted), verified (bool)."""
-    expected = _normalise_sha(expected_sha256)
+    expected_sha256, expected_sha1: digests of the image, or of the .zip it
+    comes in (see normalise_digest for the accepted spellings). Every one
+    given must match; for a zip, either all of them match the zip or all of
+    them match the image inside it.
+
+    Returns a dict: path, sha256 and sha1 (of the disc image itself), size,
+    source (redacted), verified (bool), verified_with (the algorithms
+    checked), matched ("image", "container" or None) and container (the
+    zip's digests, or None)."""
+    expected = expected_digests(expected_sha256, expected_sha1)
     os.makedirs(dest_dir, exist_ok=True)
     target = os.path.join(dest_dir, "disc.iso")
     scheme = urllib.parse.urlsplit(source).scheme.lower()
     if scheme in ("http", "https"):
-        fd, tmp = tempfile.mkstemp(dir=dest_dir, suffix=".part")
+        fd, src = tempfile.mkstemp(dir=dest_dir, suffix=".part")
         os.close(fd)
         try:
-            digest, size = _download(source, tmp, log)
+            outer, _ = _download(source, src, log)
         except Exception:
-            os.remove(tmp)
+            os.remove(src)
             raise
-        if expected and digest != expected:
-            os.remove(tmp)
-            raise IsoError("SHA-256 mismatch: expected %s, downloaded %s" % (expected, digest))
-        os.replace(tmp, target + (".zip" if source.lower().split("?")[0].endswith(".zip") else ""))
-        if os.path.exists(target + ".zip"):
-            zpath = target + ".zip"
-            target = _unwrap_zip(zpath, dest_dir, log)
-            os.remove(zpath)
-            digest_inner = _sha256(target)
-            log("image inside zip: sha256 %s" % digest_inner)
-        shown = _redact(source)
+        temporary, name, shown, what = True, urllib.parse.urlsplit(source).path, _redact(source), \
+            "the download"
     else:
         path = urllib.parse.urlsplit(source).path if scheme == "file" else source
         path = os.path.abspath(os.path.expanduser(path))
@@ -174,28 +257,64 @@ def acquire(source, dest_dir, expected_sha256=None, log=print, link_local=True):
         if os.path.getsize(path) > MAX_IMAGE_BYTES:
             raise IsoError("%s is larger than a DVD; not a disc image" % path)
         log("hashing %s" % path)
-        digest = _sha256(path)
-        if expected and digest != expected:
-            raise IsoError("SHA-256 mismatch for %s: expected %s, got %s" % (path, expected, digest))
-        if path.lower().endswith(".zip"):
-            target = _unwrap_zip(path, dest_dir, log)
-        else:
+        outer = _digests(path)
+        src, temporary, name, shown, what = path, False, path, path, path
+
+    container, matched, unzipping = None, None, False
+    # Re-running on the work directory's own copy: nothing to place.
+    in_place = not temporary and os.path.abspath(src) == os.path.abspath(target)
+    try:
+        if _is_zip(src, name):
+            if in_place:
+                raise IsoError("%s is a zip archive; give the archive's own path" % src)
             if os.path.lexists(target):
                 os.remove(target)
-            if link_local:
-                try:
-                    os.symlink(path, target)
-                except OSError:
-                    shutil.copyfile(path, target)
+            unzipping = True
+            _unwrap_zip(src, dest_dir, log)
+            container, image = outer, _digests(target)
+            log("image inside zip: sha256 %s, sha1 %s" % (image["sha256"], image["sha1"]))
+            if temporary:
+                os.remove(src)
+        else:
+            image = outer
+        if expected:
+            if _matches(expected, image):
+                matched = "image"
+            elif container and _matches(expected, container):
+                matched = "container"
             else:
-                shutil.copyfile(path, target)
-        shown = path
+                raise IsoError(_mismatch(expected, image, container, what))
+        if container is None and not in_place:
+            # Only now, verified, does it replace what a previous run left.
+            if os.path.lexists(target):
+                os.remove(target)
+            if temporary:
+                os.replace(src, target)
+            elif link_local:
+                try:
+                    os.symlink(src, target)
+                except OSError:
+                    shutil.copyfile(src, target)
+            else:
+                shutil.copyfile(src, target)
+    except Exception:
+        if temporary and os.path.exists(src):
+            os.remove(src)
+        if unzipping and os.path.lexists(target):
+            os.remove(target)               # an unverified image is not kept
+        raise
     size = os.path.getsize(target)
-    info = {"path": target, "sha256": digest, "size": size, "source": shown,
-            "verified": bool(expected)}
-    if not expected:
-        log("WARNING: no expected SHA-256 given; recorded %s but authenticity is unverified"
-            % digest)
+    order = list(HASHES)
+    info = {"path": target, "sha256": image["sha256"], "sha1": image["sha1"], "size": size,
+            "source": shown, "verified": bool(expected),
+            "verified_with": sorted(expected, key=order.index), "matched": matched,
+            "container": container}
+    if expected:
+        log("verified: %s of the %s" % (" and ".join(HASHES[a][0] for a in info["verified_with"]),
+                                        "zip" if matched == "container" else "image"))
+    else:
+        log("WARNING: no expected SHA-256 or SHA-1 given; recorded sha256 %s, sha1 %s,"
+            " but authenticity is unverified" % (image["sha256"], image["sha1"]))
     return info
 
 
