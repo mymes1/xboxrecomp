@@ -235,6 +235,9 @@ def parse_boot_log(text):
                 rest = msg[len("render: "):]
                 name, _, why = rest.partition(" ")
                 out["render"] = {"backend": name, "detail": why.strip().strip("()")}
+            elif msg.startswith("usb: "):
+                # Whether the title can see a controller (xbox_OhciInit).
+                out["usb"] = msg[len("usb: "):]
             elif msg.startswith("present: "):
                 # "present: vulkan (<swapchain>)" or "present: sdl (<why>)";
                 # the last one wins (the presenter can stop mid-run).

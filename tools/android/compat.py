@@ -120,7 +120,7 @@ def _host_summary(r):
         return None
     keep = ("platform", "entry_reached", "title_returned", "exit", "seconds", "flips",
             "display_changes", "display_set", "selftest", "display_bmp", "log", "failed_step", "note",
-            "render", "present", "audio")
+            "render", "present", "audio", "usb")
     out = {k: r.get(k) for k in keep if k in r}
     out["crash"] = r.get("crash", [])[:20]
     out["unimpl_reached"] = r.get("unimpl", [])[:20]
@@ -216,6 +216,8 @@ def to_markdown(r):
             if sc:
                 out.append("- %s: %s -- %s" % (label, "matches" if sc.get("ok") else "NO MATCH",
                                                sc.get("reason")))
+        if rt.get("usb"):
+            out.append("- controllers (USB model): %s" % rt["usb"])
         if rt.get("audio"):
             out.append("- audio output: %s (%s)" % ("initialised" if rt["audio"].get("ok")
                                                      else "FAILED", rt["audio"].get("detail")))

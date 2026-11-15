@@ -30,8 +30,8 @@ commercial title and no physical Android device have been run yet.
 | 2 | ISO download/verify/extract, XBE analysis, game project | **Done** as pipeline stages: intake (path or URL, SHA-256 and/or SHA-1, XISO detection, extraction, `default.xbe`), analysis, per-game project. Demonstrated on the test title |
 | 3 | ARM64 code generation | generated C plus runtime build with the NDK for arm64-v8a (CI) and run natively on Linux arm64 (CI: test title self-test 8/8). The `lock` family lowers atomically |
 | 4 | Android kernel/runtime | test title: **Runtime initialized** and **Game booted** on the Android emulator, whose ARM translation runs the arm64 code (self-test 8/8, the title's own frames on the scanout). Not yet on a physical device |
-| 5 | Vulkan back end | in the tree (`src/vk`), built into `libmain.so`, registered at boot, CPU-rasteriser fallback. Translates the executor's draws: register combiners, four texture stages, blending, depth, stencil, alpha test, colour mask, 16-bit and swizzled surfaces, render to texture. **Matches the CPU rasteriser on SwiftShader** (9 scenes; CI job *vulkan-backend*). In the test-title APK on the Android emulator it initialises at boot on the emulator's virtual GPU (Android Vulkan loader, under ARM translation) and the title runs on unchanged (8/8); the test title draws nothing through the NV2A, so no frame there came from it. The driver's pipeline cache is kept across runs (checked before the driver sees it), so pipelines compiled once are not compiled again at the next start; the saving depends on the driver and is unmeasured until the device run. Not yet run on a phone GPU. Frames still reach the screen through the SDL presenter: there is no Vulkan swapchain presenter yet |
-| 6 | Audio, input, assets | game files are packaged in the APK and installed to app storage on first start. Audio output, touch controls, controllers and pause/resume: not started |
+| 5 | Vulkan back end | in the tree (`src/vk`), built into `libmain.so`, registered at boot, CPU-rasteriser fallback. Translates the executor's draws: register combiners, four texture stages, blending, depth, stencil, alpha test, colour mask, 16-bit and swizzled surfaces, render to texture. **Matches the CPU rasteriser on SwiftShader** (9 scenes; CI job *vulkan-backend*). In the test-title APK on the Android emulator it initialises at boot on the emulator's virtual GPU (Android Vulkan loader, under ARM translation) and the title runs on unchanged (8/8); the test title draws nothing through the NV2A, so no frame there came from it. The driver's pipeline cache is kept across runs (checked before the driver sees it), so pipelines compiled once are not compiled again at the next start; the saving depends on the driver and is unmeasured until the device run. Not yet run on a phone GPU. **Frames reach the screen through a Vulkan swapchain** on the same device (`VK_KHR_surface`/`VK_KHR_android_surface`/`VK_KHR_swapchain`, each tested before use; the SDL renderer is only the fallback): on the Android emulator the swapchain is made on the virtual GPU and a screenshot shows the title's picture, letterboxed 4:3, colours and orientation right, before and after the app went to the background (CI screen check); on SwiftShader a headless-surface test checks 1:1 output in both pixel formats, letterboxing, resize, suspend/resume and the renderer drawing on the presenter's device. The window thread's upload/blit/present overlaps the game thread. Not done: the renderer still writes each frame back to guest memory and waits for the GPU at the flip (no CPU/GPU overlap inside the renderer), and frames are not pre-rotated for a quarter-turn display (the compositor rotates them) |
+| 6 | Audio, input, assets | game files are packaged in the APK and installed to app storage on first start. **Input**: titles read pads through the emulated USB host controller, which no POSIX host started before: the boot now does (with `RECOMP_USB`, which the launcher sets by default). An **on-screen controller** (sticks, D-pad, face buttons, triggers, Back/Start; hidden while a gamepad is connected) is merged into controller port 0 beside any real pad: on the emulator, presses on A, the left stick and Start sent with `input swipe` reach port 0 (CI). Bluetooth/USB controllers go through SDL's game controllers (the upstream path); not yet tried with a physical controller, and no real game has yet been seen reading a pad through the USB model on Android. **Pause/resume**: in the background the presenter lets go of the surface and the guest is held at its next flip; on the emulator the game survives HOME and returns, on screen, when the icon is tapped (CI). Back asks before quitting. **Audio**: the emulated APU's SDL output (upstream) opens on Android (emulator: OpenSL ES, 48 kHz stereo); it stays opt-in (launcher: Sound) because without the DSP handshake some titles stall in audio init. No title has yet played sound on Android |
 | 7 | APK packaging, launcher | APK built, signed and verified in CI (arm64-v8a only, 16 KB-aligned libraries, required symbols present, game files complete), with a launcher activity |
 | 8 | Device testing, Mali tuning | not started: needs the Galaxy Tab A9 (Mali-G57) |
 
@@ -119,16 +119,41 @@ VK_ICD_FILENAMES=$XBOXRECOMP_SWIFTSHADER_ICD LD_LIBRARY_PATH=$XBOXRECOMP_SWIFTSH
     ./build/tests/nv2a_vk_backend/nv2a-vk-backend-test
 ```
 
+The same project builds `nv2a-vk-present-test`: the window presenter on a
+headless surface (`VK_EXT_headless_surface`, which SwiftShader offers), run
+the same way.
+
 SwiftShader compiles each pipeline in software, so the run takes a few
 minutes. `RECOMP_VK_TEST_OUT=<dir>` writes both renderings of every scene as
 PPM files. After editing `src/vk/shaders/*`, regenerate the embedded SPIR-V
 with `python3 -m tools.android.vk_shaders` (CI checks it with `--check`).
 
 On a device, the boot log names the renderer: `[BOOT] render: vulkan (...)`
-with the GPU and driver, or `[BOOT] render: cpu (...)` with the reason. Set
+with the GPU and driver, or `[BOOT] render: cpu (...)` with the reason; and
+the presenter: `[BOOT] present: vulkan (swapchain ...)` or `[BOOT] present:
+sdl (...)` with the reason. Set
 `RECOMP_VK=0` to compare against the CPU rasteriser, and `RECOMP_VK_STATS=60`
 for counters and per-pipeline build times
 ([environment variables](../runtime/environment-variables.md#graphics-vulkan-back-end)).
+
+## Playing on the device
+
+- **Controls**: with no controller connected, an on-screen controller is
+  drawn over the game (Options -> On-screen controller: when no controller
+  is connected / always / never). A tap on a stick without moving clicks it.
+  Bluetooth and USB controllers are read through SDL; the on-screen one
+  hides while one is connected. Options -> Controllers (emulated USB pad)
+  must stay on for a game to see any controller.
+- **Picture**: 4:3 with black bars by default; 16:9 for games set to
+  widescreen, or fill the screen (Options -> Picture).
+- **Leaving**: Back asks before it ends the game. Home keeps it: the game
+  is held while in the background and continues when you return (from
+  Recents or the icon).
+- **Sound**: Options -> Sound turns on the emulated audio processor. Some
+  games stall in their audio start-up with it; if a game stops at a black
+  screen, turn it off.
+- **Logs**: the launcher's "Last log" shows the runtime's log of the last
+  run (`Android/data/<package>/files/logs/last_run.log`).
 
 ## Legal
 

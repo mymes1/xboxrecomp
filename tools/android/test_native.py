@@ -133,6 +133,12 @@ class BootLogTest(unittest.TestCase):
         self.assertIn("stopped", r["present"]["detail"])
         self.assertNotIn("present", native.parse_boot_log(BOOT_LOG))
 
+    def test_usb_line(self):
+        r = native.parse_boot_log("[BOOT] usb: OHCI model on (a controller on port 1 of the"
+                                  " first host controller)\n")
+        self.assertTrue(r["usb"].startswith("OHCI model on"))
+        self.assertNotIn("usb", native.parse_boot_log(BOOT_LOG))
+
     def test_audio_lines(self):
         r = native.parse_boot_log(
             "[SDL2] audio initialized: driver aaudio (48000 Hz stereo 16-bit, 4 x 512-sample"

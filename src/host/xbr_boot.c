@@ -22,6 +22,7 @@
 
 #include "kernel/xbox_memory_layout.h"
 #include "kernel/kernel.h"
+#include "usb/ohci.h"           /* xbox_OhciInit: the controllers' USB host */
 #if XBR_HAVE_VULKAN
 #include "nv2a_vk.h"            /* src/vk: the NV2A render back end on Vulkan */
 #endif
@@ -291,6 +292,18 @@ int xbr_boot_run(const XbrBootOptions *o)
         g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
         printf("[BOOT] emulated APU %s\n", g_apu_state ? "up" : "FAILED to initialise");
     }
+    /* Controllers: titles read their pads through the USB host controllers,
+     * so the OHCI model (src/usb, opt-in with RECOMP_USB) is what lets any
+     * controller -- SDL game controllers, the keyboard, Android's on-screen
+     * pad -- reach a title. Its registers trap like the APU's (the crash
+     * handler routes them through xbox_PosixMmioFault). Nothing happens
+     * without RECOMP_USB; the toolkit had no POSIX host that called this. */
+    stage("USB controllers");
+    xbox_OhciInit();
+    printf("[BOOT] usb: %s\n", xbox_OhciOwnsAddress(XBOX_OHCI0_BASE)
+               ? "OHCI model on (a controller on port 1 of the first host controller)"
+               : getenv("RECOMP_USB") ? "RECOMP_USB set but the OHCI model is off (see above)"
+                                      : "off (RECOMP_USB unset: the title sees no controller)");
 #endif
 
     stage("kernel");
