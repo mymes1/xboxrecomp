@@ -228,6 +228,10 @@ public class LauncherActivity extends Activity {
         apu.setText(getString(R.string.opt_apu));
         apu.setChecked(p.getBoolean("apu", false));
         box.addView(apu);
+        final Switch usb = new Switch(this);
+        usb.setText(getString(R.string.opt_usb));
+        usb.setChecked(p.getBoolean("usb", true));
+        box.addView(usb);
         final RadioGroup touch = choice(box, getString(R.string.opt_touch),
                 new String[] { "auto", "on", "off" },
                 new String[] { getString(R.string.touch_auto), getString(R.string.touch_on),
@@ -250,6 +254,7 @@ public class LauncherActivity extends Activity {
                 .setPositiveButton(android.R.string.ok, (d, w) -> p.edit()
                         .putBoolean("vsync", vsync.isChecked())
                         .putBoolean("apu", apu.isChecked())
+                        .putBoolean("usb", usb.isChecked())
                         .putString("touch", chosen(touch, "auto"))
                         .putString("aspect", chosen(aspect, "4:3"))
                         .putString("extra", extra.getText().toString())
@@ -301,6 +306,12 @@ public class LauncherActivity extends Activity {
         env.add("RECOMP_ASPECT=" + p.getString("aspect", "4:3"));
         if (p.getBoolean("apu", false)) {
             env.add("RECOMP_AC97_READY=1");
+        }
+        // Titles read their controllers through the emulated USB host
+        // controller (src/usb); off, a game sees none -- not even the
+        // on-screen one. Opt-out here; the toolkit's own default is off.
+        if (p.getBoolean("usb", true)) {
+            env.add("RECOMP_USB=1");
         }
         for (String line : p.getString("extra", "").split("\\s+")) {
             if (line.matches("[A-Z_][A-Z0-9_]*=.*")) {

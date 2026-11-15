@@ -142,8 +142,11 @@ The executor is itself opt-in: set `RECOMP_PB_EXEC=1` to execute the pushbuffer.
 | `RECOMP_HEADLESS` | off | No window and a dummy audio driver. | `fb_present_sdl.c`, `apu_sdl2.c` |
 | `RECOMP_CLOSE_KEEPS_RUNNING=1` | off | Closing the window only closes it instead of exiting the process. | `fb_present.c` |
 | `RECOMP_D3D_PRESENT` | off | Presents through a D3D11 swap chain. | `gpu_present.c` |
-| `RECOMP_PRESENT_VSYNC` | on | `0` turns vsync off. | `gpu_present.c`, `fb_present_sdl.c` |
-| `RECOMP_PRESENT_FILTER` | default | Sampler filter for the D3D11 present. | `gpu_present.c` |
+| `RECOMP_PRESENT_VSYNC` | on | `0` turns vsync off. With the Vulkan presenter: FIFO when on; mailbox, else immediate, when off. | `gpu_present.c`, `fb_present_sdl.c`, `src/vk/nv2a_vk.c` |
+| `RECOMP_PRESENT_FILTER` | default; Vulkan presenter: `linear` | Sampler filter for the D3D11 present; for the Vulkan presenter, `nearest` scales without smoothing. | `gpu_present.c`, `src/vk/nv2a_vk.c` |
+| `RECOMP_PRESENT=vulkan\|sdl` | `vulkan` on Android, `sdl` elsewhere | [android-port] Who puts the POSIX window's frames on the screen: a Vulkan swapchain on the NV2A renderer's device, or the SDL renderer. Falls back to the SDL renderer when Vulkan cannot present to the window, at start or later; the log says which (`[BOOT] present: ...`). | `src/host/xbr_window.c`, `src/vk/nv2a_vk.c` |
+| `RECOMP_ASPECT=4:3\|16:9\|<w>:<h>\|stretch\|native` | `4:3` | [android-port] Vulkan presenter: the picture's shape on the screen, centred with black bars; `stretch` fills the window, `native` keeps the frame's own proportions. | `src/vk/nv2a_vk.c` |
+| `RECOMP_PRESENT_CAPTURE=1` | off | [android-port] Vulkan presenter: keep a copy of each presented image (tests: `nv2a_vk_present_capture`). | `src/vk/nv2a_vk.c` |
 | `RECOMP_FMV_HOST` | off | Plays a movie through the host player when the title asks to. A substitute for the title's own output. | `kernel_bridge.c` |
 | `RECOMP_FMV_DUMP=<prefix>` | off | Writes two frames of a movie as BMP evidence. | `video_pump.c` |
 
@@ -175,6 +178,8 @@ See [xbox_input](../../src/input/README.md).
 | `RECOMP_MKB` | off | Keyboard-and-mouse layer; tuned by `RECOMP_MKB_SENS`, `_DZ`, `_ACC`, `_FULL`, `_INVERT_Y`, `_SWAP_STICKS` or an `RECOMP_MKB_INI` file. | `mkb_input.c` |
 | `RECOMP_KEY_TRACE` | off | Prints the first 40 key-downs. | `keyboard_sdl.c`, `fb_present.c` |
 | `RECOMP_INPUT_DIAG` | off | Reports whether the input chain is wired. | `usb_gamepad.c` |
+| `RECOMP_INPUT_TRACE=1` | off | [android-port] Logs `[INPUT] port 0: ...` whenever what controller port 0 reports changes (controllers, keyboard and the on-screen controller, read through `xbox_InputGetState` at 20 Hz as the emulated USB pad reads it). | `src/host/xbr_window.c` |
+| `XBR_TOUCH=auto\|on\|off` | `auto` | [android-port] App setting (read by the game activity, not the runtime): the on-screen controller, merged into port 0; `auto` hides it while a gamepad is connected. | `TouchControlsView.java` |
 | `RECOMP_RUMBLE` | on | `0` turns rumble off. | `ohci.c` |
 | `RECOMP_USB` | off | Enables the USB controller model. | `ohci.c` |
 | `RECOMP_USB_PADS=1..4` | 1 | Number of pads plugged. | `ohci.c` |

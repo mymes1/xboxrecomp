@@ -89,7 +89,9 @@ def _raw_screen(adb, serial):
 
 
 def _screen(adb, serial, log, what):
-    r = screen_check.check(_raw_screen(adb, serial))
+    # The on-screen controller is drawn over the letterbox: look around it.
+    avoid = list(parse_touch_layout(_game_log(adb)).values())
+    r = screen_check.check(_raw_screen(adb, serial), avoid=avoid)
     log("screen (%s): %s -- %s" % (what, "matches" if r.get("ok") else "NO MATCH", r.get("reason")))
     return r
 

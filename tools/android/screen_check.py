@@ -19,7 +19,9 @@ Input: what `adb exec-out screencap` writes without -p: width, height,
 pixel format (1 RGBA_8888, 2 RGBX_8888, 5 BGRA_8888) as little-endian
 uint32s, on Android 10 and later a fourth (the dataspace), then the pixels.
 
-`check(raw)` returns a dict: ok, reason, and what was measured.
+`check(raw, avoid)` returns a dict: ok, reason, and what was measured.
+`avoid`: circles (x, y, r) drawn over the screen -- the on-screen controller,
+from its logged layout -- where the letterbox is not expected to be black.
 """
 
 import struct
@@ -98,7 +100,11 @@ def _band_box(scr, want):
     return x0, y0, x1, y1
 
 
-def check(raw):
+def _covered(x, y, avoid):
+    return any((x - cx) ** 2 + (y - cy) ** 2 <= (r * 1.3 + 4) ** 2 for (cx, cy, r) in avoid)
+
+
+def check(raw, avoid=()):
     try:
         w, h, scr = parse_raw(raw)
     except ValueError as e:
@@ -142,13 +148,20 @@ def check(raw):
         out.update(ok=False, reason="the bars are not in the title's order (%s): mirrored,"
                                     " rotated or colour-swapped" % seen)
         return out
-    # Letterbox: black beyond the picture, where there is room for it.
+    # Letterbox: black beyond the picture, where there is room for it --
+    # down the middle of each bar, except under the on-screen controls.
     edges = []
-    my = min(h - 1, max(0, py0 + ph // 2))
+    xs = []
     if bx0 >= 8:
-        edges.append((bx0 // 2, my))
+        xs.append(bx0 // 2)
     if w - 1 - bx1 >= 8:
-        edges.append(((bx1 + w) // 2, my))
+        xs.append((bx1 + w) // 2)
+    for x in xs:
+        for k in range(1, 8):
+            y = min(h - 1, max(0, py0 + ph * k // 8))
+            if not _covered(x, y, avoid):
+                edges.append((x, y))
+    out["letterbox_skipped"] = len(xs) * 7 - len(edges)
     for (x, y) in edges:
         if not _near(scr.px(x, y), (0, 0, 0), 24):
             out.update(ok=False, reason="the screen at (%d,%d) beside the picture is %s, not"

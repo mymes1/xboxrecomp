@@ -254,6 +254,12 @@ def parse_boot_log(text):
                                   "pitch": int(m.group(5)), "fbsum": m.group(6),
                                   "fbchanges": int(m.group(7))})
             continue
+        # Audio output (src/apu/apu_sdl2.c), when the emulated APU is on.
+        if line.startswith("[SDL2] audio initialized: "):
+            out["audio"] = {"ok": True, "detail": line[len("[SDL2] audio initialized: "):]}
+        elif line.startswith("[SDL2] audio init failed: ") or \
+                line.startswith("[SDL2] SDL_OpenAudioDevice failed: "):
+            out["audio"] = {"ok": False, "detail": line[len("[SDL2] "):]}
         if line.startswith("[HOST] background") or line.startswith("[HOST] foreground"):
             out["lifecycle"].append(line[len("[HOST] "):].split(":")[0])
         if line.startswith("[CRASH]"):

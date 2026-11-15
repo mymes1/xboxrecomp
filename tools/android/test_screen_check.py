@@ -53,6 +53,24 @@ class ScreenCheckTest(unittest.TestCase):
         r = sc.check(bytes(out))
         self.assertFalse(r["ok"], r)
 
+    def test_controls_over_the_letterbox(self):
+        # A grey disc in the left bar (an on-screen control): a failure unless
+        # the check is told to look around it.
+        import struct as _s
+        w, h = 320, 180
+        raw = bytearray(sc.synth(w, h, phase=2))
+        cx, cy, r = 20, 90, 12
+        for y in range(cy - r, cy + r + 1):
+            for x in range(cx - r, cx + r + 1):
+                if (x - cx) ** 2 + (y - cy) ** 2 <= r * r:
+                    i = 16 + (y * w + x) * 4
+                    raw[i:i + 4] = bytes((160, 160, 160, 255))
+        self.assertFalse(sc.check(bytes(raw))["ok"])
+        res = sc.check(bytes(raw), avoid=[(cx, cy, r)])
+        self.assertTrue(res["ok"], res)
+        self.assertGreater(res["letterbox_skipped"], 0)
+        self.assertGreater(res["letterbox_samples"], 0)
+
     def test_bad_input(self):
         self.assertFalse(sc.check(b"\x00" * 8)["ok"])
         raw = bytearray(16 + 10 * 10 * 4)

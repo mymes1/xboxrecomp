@@ -133,6 +133,17 @@ class BootLogTest(unittest.TestCase):
         self.assertIn("stopped", r["present"]["detail"])
         self.assertNotIn("present", native.parse_boot_log(BOOT_LOG))
 
+    def test_audio_lines(self):
+        r = native.parse_boot_log(
+            "[SDL2] audio initialized: driver aaudio (48000 Hz stereo 16-bit, 4 x 512-sample"
+            " buffers, 42.7 ms queued max)\n")
+        self.assertTrue(r["audio"]["ok"])
+        self.assertTrue(r["audio"]["detail"].startswith("driver aaudio"))
+        r = native.parse_boot_log("[SDL2] SDL_OpenAudioDevice failed: no audio device\n")
+        self.assertFalse(r["audio"]["ok"])
+        self.assertIn("no audio device", r["audio"]["detail"])
+        self.assertNotIn("audio", native.parse_boot_log(BOOT_LOG))
+
     def test_render_line(self):
         r = native.parse_boot_log(
             "[BOOT] render: vulkan (Vulkan 1.3.0 on Mali-G57 MC2 (integrated GPU), depth D24S8)\n")

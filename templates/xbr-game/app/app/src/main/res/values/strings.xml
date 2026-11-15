@@ -15,6 +15,7 @@
     <string name="no_log">No log yet: the game has not been started.</string>
     <string name="opt_vsync">Wait for the display (vsync)</string>
     <string name="opt_apu">Sound (emulated audio processor; some games stall with it)</string>
+    <string name="opt_usb">Controllers (emulated USB pad: touch, Bluetooth and USB controllers)</string>
     <string name="opt_touch">On-screen controller</string>
     <string name="touch_auto">When no controller is connected</string>
     <string name="touch_on">Always</string>
