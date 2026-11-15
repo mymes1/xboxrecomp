@@ -332,6 +332,23 @@ def ensure_archive(name, spec, deps_dir, check_only=False):
 
 # -------------------------------------------------------------- test tools
 
+def _unbrotli(data):
+    """brotli.decompress, from a fresh interpreter when this one cannot import
+    the module yet (the python-dev group installed it earlier in this run)."""
+    try:
+        import brotli
+        return brotli.decompress(data)
+    except ImportError:
+        pass
+    r = subprocess.run([sys.executable, "-c", "import brotli, sys; "
+                        "sys.stdout.buffer.write(brotli.decompress(sys.stdin.buffer.read()))"],
+                       input=data, capture_output=True)
+    if r.returncode != 0:
+        raise DepError("swiftshader needs the brotli module: python3 -m pip install "
+                       "--require-hashes -r tools/android/requirements-dev.txt")
+    return r.stdout
+
+
 def ensure_swiftshader(spec, deps_dir, check_only=False):
     """SwiftShader (a CPU Vulkan device) for tests/nv2a_vk_backend: the npm
     tarball verified by SHA-256, the brotli'd tar inside it verified, and the
@@ -349,11 +366,6 @@ def ensure_swiftshader(spec, deps_dir, check_only=False):
         return {"path": icd, "dir": out_dir, "version": spec["version"]}
     if check_only:
         raise DepError("swiftshader not fetched")
-    try:
-        import brotli
-    except ImportError:
-        raise DepError("swiftshader needs the brotli module: python3 -m pip install "
-                       "--require-hashes -r tools/android/requirements-dev.txt")
     dl = os.path.join(deps_dir, "downloads", os.path.basename(spec["url"]))
     download_verified(spec["url"], dl, spec["sha256"])
     with tarfile.open(dl, "r:gz") as t:
@@ -361,7 +373,7 @@ def ensure_swiftshader(spec, deps_dir, check_only=False):
     if hashlib.sha256(packed).hexdigest() != spec["member_sha256"]:
         raise DepError("swiftshader: %s does not match its pinned SHA-256" % spec["member"])
     os.makedirs(out_dir, exist_ok=True)
-    with tarfile.open(fileobj=io.BytesIO(brotli.decompress(packed))) as t:
+    with tarfile.open(fileobj=io.BytesIO(_unbrotli(packed))) as t:
         for m in t.getmembers():
             name = os.path.basename(m.name)
             if m.isfile() and (name in spec["files_sha256"] or name == spec["icd"]):

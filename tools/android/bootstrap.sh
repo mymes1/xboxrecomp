@@ -4,6 +4,8 @@
 #   bash tools/android/bootstrap.sh            # all: python, git, archives, gradle, sdk
 #   bash tools/android/bootstrap.sh --no-sdk   # skip the Android SDK/NDK (host-only work)
 #   bash tools/android/bootstrap.sh --dev      # also the test-only Python packages
+#   bash tools/android/bootstrap.sh --vk-test  # also SwiftShader, a CPU Vulkan device for
+#                                              # tests/nv2a_vk_backend (implies --dev)
 #
 # Pins: tools/android/deps.lock.json. Verification rules: tools/android/fetch_deps.py.
 # Afterwards:  source build/android-deps/android-env.sh
@@ -19,9 +21,10 @@ for a in "$@"; do
         --no-sdk) want="${want/,sdk/}" ;;
         --no-gradle) want="${want/,gradle/}" ;;
         --dev) want="$want,python-dev" ;;
+        --vk-test) want="$want,python-dev,test-vk" ;;
         --check) extra+=(--check) ;;
         --deps-dir=*) extra+=(--deps-dir "${a#--deps-dir=}") ;;
-        -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
         *) echo "unknown option: $a" >&2; exit 2 ;;
     esac
 done

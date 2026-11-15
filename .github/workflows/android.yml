@@ -243,6 +243,72 @@ jobs:
             build/games/xbrtest/pipeline_state.json
           if-no-files-found: warn
 
+  vulkan-backend:
+    # [android-port] The NV2A -> Vulkan back end (src/vk) draws the scenes of
+    # tests/nv2a_vk_backend; the executor's CPU rasteriser draws them too, and
+    # the framebuffers must agree. SwiftShader (pinned, verified) is the
+    # Vulkan device: hosted runners have no GPU. Passing here is not evidence
+    # about a phone GPU -- that needs the device run (docs/android/README.md).
+    name: Vulkan back end vs the CPU rasteriser (SwiftShader)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pinned sources
+        uses: actions/cache@v4
+        with:
+          path: build/android-deps/src
+          key: vk-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/android/deps.lock.json') }}
+
+      - name: Pinned dependencies (Vulkan-Headers, glslang, SwiftShader; verified)
+        run: bash tools/android/bootstrap.sh --no-sdk --no-gradle --vk-test
+
+      - name: The committed SPIR-V matches its shaders
+        run: python3 -m tools.android.vk_shaders --check
+
+      - name: Executor tests (the back-end interface the Vulkan back end uses)
+        run: |
+          for t in nv2a_combiner nv2a_ffp_backend nv2a_pb_constants nv2a_pb_walk \
+                   nv2a_raster_batch nv2a_tex_filter nv2a_vsh; do
+            cmake -S tests/$t -B build/tests/$t -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo > /dev/null
+            cmake --build build/tests/$t > /dev/null
+            (cd build/tests/$t && ctest --output-on-failure)
+          done
+
+      - name: Vulkan back end against the CPU rasteriser
+        run: |
+          source build/android-deps/android-env.sh
+          cmake -S tests/nv2a_vk_backend -B build/tests/nv2a_vk_backend -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build/tests/nv2a_vk_backend
+          mkdir -p build/vk-test-out
+          # Run directly, not through ctest: here exit 77 (no Vulkan device)
+          # is a failure, not a skip.
+          set -o pipefail
+          VK_ICD_FILENAMES="$XBOXRECOMP_SWIFTSHADER_ICD" \
+          LD_LIBRARY_PATH="$XBOXRECOMP_SWIFTSHADER_DIR" \
+          RECOMP_VK_STATS=1000000 RECOMP_VK_TEST_OUT=build/vk-test-out \
+            ./build/tests/nv2a_vk_backend/nv2a-vk-backend-test 2>&1 \
+            | grep -v '^ *\[GPU\]' | tee build/vk-test-out/result.txt
+          {
+            echo "### Vulkan back end vs the CPU rasteriser (SwiftShader)"
+            echo '```'
+            cat build/vk-test-out/result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vulkan-backend-test
+          path: build/vk-test-out
+          if-no-files-found: warn
+
   user-title:
     name: your disc image -> Android arm64-v8a (manual)
     if: github.event_name == 'workflow_dispatch'
