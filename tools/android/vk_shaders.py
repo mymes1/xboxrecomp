@@ -1,0 +1,171 @@
+"""Compile the Vulkan back end's GLSL to SPIR-V and embed it as a C header.
+
+    python3 -m tools.android.vk_shaders            # rewrite src/vk/nv2a_vk_spv.h
+    python3 -m tools.android.vk_shaders --check    # exit 1 if it is stale
+
+[android-port] src/vk/nv2a_vk.c (the NV2A -> Vulkan back end) creates its
+shader modules from SPIR-V words compiled into the binary, so neither a
+build nor the device needs a shader compiler. Those words live in
+src/vk/nv2a_vk_spv.h, which this script generates from src/vk/shaders/*
+with the pinned glslangValidator (tools/android/deps.lock.json, archive
+"glslangValidator", fetched and SHA-256-verified by
+`python3 -m tools.android.fetch_deps --only archives`).
+
+The header records each source file's SHA-256 and the compiler version.
+--check regenerates in memory and compares, so CI notices a shader edited
+without regenerating its SPIR-V (or a header edited by hand). glslang's
+output is deterministic for a given version and input.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SHADER_DIR = os.path.join(ROOT, "src", "vk", "shaders")
+HEADER = os.path.join(ROOT, "src", "vk", "nv2a_vk_spv.h")
+DEPS_DIR = os.path.join(ROOT, "build", "android-deps")
+LOCK = os.path.join(ROOT, "tools", "android", "deps.lock.json")
+
+# (source file, C identifier). Order is the header's order.
+SHADERS = (
+    ("nv2a.vert", "nv2a_vk_vert_spv"),
+    ("nv2a.frag", "nv2a_vk_frag_spv"),
+)
+
+# Vulkan 1.0 SPIR-V (1.0): what every Vulkan device accepts.
+TARGET_ENV = "vulkan1.0"
+
+
+class ShaderError(RuntimeError):
+    pass
+
+
+def locked_version() -> str:
+    with open(LOCK, encoding="utf-8") as f:
+        return json.load(f)["archives"]["glslangValidator"]["version"]
+
+
+def find_glslang(explicit: str | None = None) -> str:
+    """The pinned glslangValidator: --glslang, $XBR_GLSLANG, else the one
+    fetch_deps verified (its manifest), else build/android-deps/tools."""
+    cands = []
+    if explicit:
+        cands.append(explicit)
+    if os.environ.get("XBR_GLSLANG"):
+        cands.append(os.environ["XBR_GLSLANG"])
+    manifest = os.path.join(DEPS_DIR, "deps-manifest.json")
+    if os.path.exists(manifest):
+        with open(manifest, encoding="utf-8") as f:
+            entry = json.load(f).get("archives", {}).get("glslangValidator")
+        if entry and entry.get("path"):
+            cands.append(entry["path"])
+    cands.append(os.path.join(DEPS_DIR, "tools", "glslangValidator",
+                              "glslangValidator.linux"))
+    for c in cands:
+        if os.path.isfile(c):
+            if not os.access(c, os.X_OK):
+                os.chmod(c, 0o755)
+            return c
+    raise ShaderError(
+        "glslangValidator not found; run `python3 -m tools.android.fetch_deps "
+        "--only archives` (or pass --glslang PATH)")
+
+
+def glslang_version(exe: str) -> str:
+    out = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                         check=True).stdout
+    for line in out.splitlines():
+        if line.startswith("Glslang Version:"):
+            # "Glslang Version: 10:11.7.0"
+            return line.split(":")[-1].strip()
+    raise ShaderError("cannot read the glslangValidator version:\n" + out)
+
+
+def compile_one(exe: str, src: str) -> bytes:
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "out.spv")
+        r = subprocess.run([exe, "-V", "--target-env", TARGET_ENV, "-o", out, src],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise ShaderError(f"glslangValidator failed on {src}:\n{r.stdout}{r.stderr}")
+        with open(out, "rb") as f:
+            data = f.read()
+    if len(data) % 4 or data[:4] != b"\x03\x02\x23\x07":
+        raise ShaderError(f"{src}: output is not SPIR-V")
+    return data
+
+
+def words_c(name: str, data: bytes) -> str:
+    words = [int.from_bytes(data[i:i + 4], "little") for i in range(0, len(data), 4)]
+    lines = []
+    for i in range(0, len(words), 6):
+        lines.append("    " + ", ".join(f"0x{w:08x}u" for w in words[i:i + 6]) + ",")
+    return (f"static const uint32_t {name}[{len(words)}] = {{\n"
+            + "\n".join(lines) + "\n};\n")
+
+
+def generate(exe: str) -> str:
+    version = glslang_version(exe)
+    want = locked_version()
+    if version != want:
+        raise ShaderError(f"glslangValidator {version} is not the pinned {want}")
+    parts = []
+    srcs = []
+    for fname, cname in SHADERS:
+        path = os.path.join(SHADER_DIR, fname)
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        srcs.append(f" *   src/vk/shaders/{fname}  sha256 {digest}")
+        parts.append(words_c(cname, compile_one(exe, path)))
+    head = (
+        "/* GENERATED by `python3 -m tools.android.vk_shaders` -- do not edit.\n"
+        " *\n"
+        " * [android-port] SPIR-V of the Vulkan back end's shaders (src/vk/nv2a_vk.c),\n"
+        f" * compiled by glslangValidator {version} for {TARGET_ENV} from:\n"
+        + "\n".join(srcs) + "\n"
+        " * CI runs `python3 -m tools.android.vk_shaders --check` against this file.\n"
+        " */\n"
+        "#ifndef NV2A_VK_SPV_H\n#define NV2A_VK_SPV_H\n\n#include <stdint.h>\n\n")
+    return head + "\n".join(parts) + "\n#endif /* NV2A_VK_SPV_H */\n"
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="tools.android.vk_shaders",
+                                 description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--check", action="store_true",
+                    help="regenerate in memory; exit 1 if src/vk/nv2a_vk_spv.h differs")
+    ap.add_argument("--glslang", help="glslangValidator to use (must be the pinned version)")
+    args = ap.parse_args(argv)
+    try:
+        text = generate(find_glslang(args.glslang))
+    except (ShaderError, subprocess.CalledProcessError, OSError) as e:
+        print(f"vk_shaders: {e}", file=sys.stderr)
+        return 2
+    if args.check:
+        try:
+            with open(HEADER, encoding="utf-8") as f:
+                current = f.read()
+        except FileNotFoundError:
+            current = ""
+        if current != text:
+            print("vk_shaders: src/vk/nv2a_vk_spv.h is stale; run "
+                  "`python3 -m tools.android.vk_shaders` and commit it", file=sys.stderr)
+            return 1
+        print("vk_shaders: src/vk/nv2a_vk_spv.h matches its sources")
+        return 0
+    with open(HEADER, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    print(f"vk_shaders: wrote {os.path.relpath(HEADER, ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

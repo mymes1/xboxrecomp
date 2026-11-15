@@ -2261,6 +2261,7 @@ static Nv2aVertex *backend_slot(void)
  * demand (a full batch would be 22 MB), sharing s_bcount and the cap. */
 static Nv2aVertexEx *s_bvx;
 static uint32_t      s_bvx_cap;
+static int           s_bvx_screen;      /* the batch is screen-space */
 
 static Nv2aVertexEx *backend_slot_ex(void)
 {
@@ -2356,6 +2357,11 @@ static void backend_flush(int textured)
         bx.textured = textured && s_gpu.texs[0].valid;
         bx.fog_color = s_gpu.fog_color;
         bx.clip_plane_mode = s_gpu.clip_plane_mode;
+        bx.screen_space = (uint32_t)s_bvx_screen;
+        if (s_bvx_screen) {
+            bx.use_rc = 0;
+            bx.textured = textured && s_gpu.texs[0].valid;
+        }
         s_backend->draw_ex(&sx, &bx);
         s_gpu.tris_drawn += s_bcount / 3;
         s_bcount = 0;
@@ -2410,30 +2416,34 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
             && fetch_texcoord(i2, uv[2]);
 
     if (backend_ex()) {
-        /* [android-port] Screen space: w from the vertex's rhw, colour from
-         * its stream, stage 0's coordinate normalised the way a program's
-         * would be (fetch_texcoord gave texels). */
+        /* [android-port] Shaped for raster_triangle's rule (Nv2aBatchEx,
+         * screen_space): one flat colour, the texel replacing it when there
+         * is one, texture coordinates interpolated affinely (w = 1) and
+         * normalised the way a program's are (fetch_texcoord gave texels). */
         Nv2aVertexEx *o = backend_slot_ex();
-        const uint32_t ix[3] = { i0, i1, i2 };
-        float su = 1.0f, sv = 1.0f;
-        int k;
+        float su = 1.0f, sv = 1.0f, flat[4];
+        int k, tex = textured && s_gpu.texs[0].valid;
 
         if (!o)
             return;
+        s_bvx_screen = 1;
         if (tex_size_from_format(s_gpu.texs[0].color)) {
             su = s_gpu.texs[0].width  ? (float)s_gpu.texs[0].width  : 1.0f;
             sv = s_gpu.texs[0].height ? (float)s_gpu.texs[0].height : 1.0f;
         }
+        if (tex)
+            flat[0] = flat[1] = flat[2] = flat[3] = 1.0f;
+        else
+            nv2a_rc_unpack(argb, flat);
         memset(o, 0, 3 * sizeof *o);
         for (k = 0; k < 3; k++) {
-            float rhw = p[k][3];
             o[k].pos[0] = p[k][0];
             o[k].pos[1] = p[k][1];
             o[k].pos[2] = p[k][2];
-            o[k].pos[3] = (rhw > 1e-20f && rhw < 1e20f) ? 1.0f / rhw : 1.0f;
-            nv2a_rc_unpack(vertex_color(ix[k]), o[k].d0);
+            o[k].pos[3] = 1.0f;
+            memcpy(o[k].d0, flat, sizeof flat);
             o[k].fog = 1.0f;
-            if (textured) {
+            if (tex) {
                 o[k].tex[0][0] = uv[k][0] / su;
                 o[k].tex[0][1] = uv[k][1] / sv;
                 o[k].tex[0][3] = 1.0f;
@@ -3270,6 +3280,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     if (backend_ex()) {                        /* [android-port] */
         Nv2aVertexEx *o = backend_slot_ex();
         if (o) {
+            s_bvx_screen = 0;
             for (k = 0; k < 3; k++) {
                 memcpy(o[k].pos, v[k]->pos, sizeof o[k].pos);
                 memcpy(o[k].d0, v[k]->d0, sizeof o[k].d0);

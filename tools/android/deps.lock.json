@@ -74,7 +74,7 @@
       "npm_integrity": "sha512-YmMhXD9psUC6dVlfTZ1GB4AaeJIG8DZ3G2oYtWcZ3D15KbVKuhFT2tlq7FqD1cEWrP+kfVaV9dKOrIgKk6mMaw==",
       "member": "package/bin/glslangValidator.linux",
       "host": "linux-x86_64",
-      "used_for": "regenerating the committed SPIR-V of src/vulkan/shaders (scripts/gen_spirv.py); builds do not need it"
+      "used_for": "regenerating the committed SPIR-V header src/vk/nv2a_vk_spv.h from src/vk/shaders (python3 -m tools.android.vk_shaders); builds do not need it"
     }
   },
   "git_dev": {

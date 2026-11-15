@@ -138,7 +138,14 @@ typedef struct {
 /* The combiners decide each pixel when use_rc is set; otherwise the pixel is
  * d0, times stage 0's texel when `textured` -- exactly the executor's two
  * paths. A stage contributes when combiner.stage_program says so (5 bits a
- * stage). Fog colour as sent: R in bits 0-7. */
+ * stage). Fog colour as sent: R in bits 0-7.
+ *
+ * screen_space: the batch came through the executor's screen-space path (a
+ * batch neither a vertex program nor the fixed-function pipeline
+ * transforms), which raster_triangle draws with no depth test or write, no
+ * alpha test and no combiners. The executor has already shaped its vertices
+ * for the rule above: w = 1 (affine texturing), d0 the flat colour, or
+ * white when textured (the texel replaces the colour). */
 typedef struct {
     const Nv2aVertexEx    *vertices; /* triangle list */
     uint32_t               count;
@@ -148,6 +155,7 @@ typedef struct {
     uint32_t               use_rc, textured;
     uint32_t               fog_color;
     uint32_t               clip_plane_mode;     /* SET_SHADER_CLIP_PLANE_MODE */
+    uint32_t               screen_space;
 } Nv2aBatchEx;
 
 typedef struct {
