@@ -2305,6 +2305,7 @@ static void stage_ex(int st, Nv2aStage *o)
     o->border_color = (uint32_t)t->border_color;
     o->cube         = (uint32_t)t->cube;
     o->face_stride  = t->cube ? tex_face_stride(t) : 0;
+    o->normalized   = (uint32_t)tex_size_from_format(t->color);
 }
 
 static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)

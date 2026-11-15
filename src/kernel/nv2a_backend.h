@@ -116,7 +116,7 @@ typedef struct {
  * linearly in screen space, as the CPU rasteriser does; fog is the fog
  * unit's factor (1 = no fog). tex: stage s's s, t, r, q as the vertex
  * program wrote them -- normalised for swizzled and DXT textures, texels for
- * linear ones (Nv2aStage.tex.pitch != 0) -- interpolated perspective-correct. */
+ * linear ones (Nv2aStage.normalized) -- interpolated perspective-correct. */
 typedef struct {
     float pos[4];
     float d0[4], d1[4];
@@ -133,6 +133,8 @@ typedef struct {
     uint32_t border_color;          /* FORMAT: address mode 4 reads `border` */
     uint32_t cube;                  /* six faces of face_stride bytes each */
     uint32_t face_stride;
+    uint32_t normalized;            /* coordinates in [0,1) (swizzled, DXT),
+                                       not texels (linear formats) */
 } Nv2aStage;
 
 /* The combiners decide each pixel when use_rc is set; otherwise the pixel is
