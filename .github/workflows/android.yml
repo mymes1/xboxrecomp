@@ -281,6 +281,7 @@ jobs:
           done
 
       - name: Vulkan back end against the CPU rasteriser
+        id: vktest
         run: |
           source build/android-deps/android-env.sh
           cmake -S tests/nv2a_vk_backend -B build/tests/nv2a_vk_backend -G Ninja \
@@ -295,12 +296,17 @@ jobs:
           RECOMP_VK_STATS=1000000 RECOMP_VK_TEST_OUT=build/vk-test-out \
             ./build/tests/nv2a_vk_backend/nv2a-vk-backend-test 2>&1 \
             | grep -v '^ *\[GPU\]' | tee build/vk-test-out/result.txt
-          {
-            echo "### Vulkan back end vs the CPU rasteriser (SwiftShader)"
-            echo '```'
-            cat build/vk-test-out/result.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The step summary is only visible in the web UI; the check run can be
+      # read through the checks API, which is how results are verified.
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -m tools.android.ci_report --name vulkan-backend --post \
+            --text-file build/vk-test-out/result.txt --outcome "${{ steps.vktest.outcome }}" \
+            --note "Vulkan back end vs the CPU rasteriser on SwiftShader (a CPU Vulkan device): not evidence about a phone GPU."
 
       - uses: actions/upload-artifact@v4
         if: always()

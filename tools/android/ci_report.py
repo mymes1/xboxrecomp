@@ -123,6 +123,22 @@ def summarize(work, name, extra=None):
     return text, ok
 
 
+def summarize_text(path, name, outcome, extra=None):
+    """A test's own output as the report; ok only when the step succeeded."""
+    ok = outcome == "success"
+    lines = ["## %s: %s" % (name, "ok" if ok else "FAILED (step outcome: %s)" % (outcome or "unknown")), ""]
+    lines += list(extra or [])
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            body = f.read()
+    except OSError:
+        body = "(no output: %s was not written)" % path
+    if len(body) > LIMIT - 2000:
+        body = "... (start truncated)\n" + body[-(LIMIT - 2000):]
+    lines += ["", "```", body.rstrip("\n"), "```"]
+    return "\n".join(lines), ok
+
+
 def post_check(name, text, ok):
     repo, sha = os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_SHA")
     if not repo or not sha:
@@ -143,13 +159,19 @@ def post_check(name, text, ok):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--work", required=True)
+    ap.add_argument("--work", help="pipeline work directory to summarise")
+    ap.add_argument("--text-file",
+                    help="instead of --work: report this file (a test's output) as it is")
+    ap.add_argument("--outcome", default="",
+                    help="with --text-file: the step outcome; only 'success' is ok")
     ap.add_argument("--name", required=True)
     ap.add_argument("--post", action="store_true")
     ap.add_argument("--note", action="append", default=[], help="extra line(s) at the top")
     ap.add_argument("--note-file", action="append", default=[],
                     help="file(s) whose contents go at the top, in a code block")
     a = ap.parse_args(argv)
+    if bool(a.work) == bool(a.text_file):
+        ap.error("give exactly one of --work and --text-file")
     extra = list(a.note)
     for p in a.note_file:
         try:
@@ -157,7 +179,10 @@ def main(argv=None):
                 extra.append("```\n%s\n```" % f.read()[-8000:])
         except OSError:
             extra.append("(missing: %s)" % p)
-    text, ok = summarize(a.work, a.name, extra)
+    if a.text_file:
+        text, ok = summarize_text(a.text_file, a.name, a.outcome, extra)
+    else:
+        text, ok = summarize(a.work, a.name, extra)
     summ = os.environ.get("GITHUB_STEP_SUMMARY")
     if summ:
         with open(summ, "a", encoding="utf-8") as f:
