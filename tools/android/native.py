@@ -93,6 +93,21 @@ def sdl2_source():
     return d
 
 
+def vulkan_headers():
+    """The pinned Vulkan-Headers include directory, or None (then CMake looks
+    in the toolchain: the NDK sysroot has its own)."""
+    d = os.environ.get("XBOXRECOMP_VULKAN_HEADERS_DIR") or os.path.join(
+        deps_dir(), "src", "Vulkan-Headers", "include")
+    return d if os.path.exists(os.path.join(d, "vulkan", "vulkan.h")) else None
+
+
+def _vulkan_defs(defs):
+    vh = vulkan_headers()
+    if vh:
+        defs["XBOXRECOMP_VULKAN_HEADERS_DIR"] = vh
+    return defs
+
+
 def _props(path):
     out = {}
     try:
@@ -214,6 +229,11 @@ def parse_boot_log(text):
             out["boot"].append(msg)
             if msg.startswith("entering xbe_entry_point"):
                 out["entry_reached"] = True
+            elif msg.startswith("render: "):
+                # "render: vulkan (<device>)" or "render: cpu (<why>)"
+                rest = msg[len("render: "):]
+                name, _, why = rest.partition(" ")
+                out["render"] = {"backend": name, "detail": why.strip().strip("()")}
             elif msg.startswith("title returned"):
                 out["title_returned"] = True
             elif msg.startswith("FAILED"):
@@ -328,6 +348,7 @@ def build_ndk(work, run=_default_run, ndk=None, allow_other_ndk=False, build_typ
         "XBR_TOOLKIT_DIR": ROOT,
         "XBR_SDL2_SOURCE_DIR": sdl2_source(),
     }
+    _vulkan_defs(defs)
     t0 = time.time()
     _cmake_build(run, native, build, defs, targets=["main", "SDL2"])
     out = os.path.join(work, "out", "lib", "arm64-v8a")
@@ -449,6 +470,7 @@ def compile_check(work, run=_default_run, log=print):
     tc, where = _zig_toolchain(build, api)
     defs = {"CMAKE_TOOLCHAIN_FILE": tc, "CMAKE_BUILD_TYPE": "Release", "XBR_TOOLKIT_DIR": ROOT,
             "XBR_SDL2_SOURCE_DIR": sdl2_source(), "XBR_COMPILE_CHECK": "ON"}
+    _vulkan_defs(defs)
     t0 = time.time()
     _cmake_build(run, native, build, defs)
     objs = []

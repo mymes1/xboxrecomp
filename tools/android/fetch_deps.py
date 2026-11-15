@@ -21,6 +21,7 @@ build needs is written to <deps-dir>/android-env.sh.
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -329,6 +330,49 @@ def ensure_archive(name, spec, deps_dir, check_only=False):
     return {"path": target, "version": spec.get("version"), "sha256": spec["sha256"]}
 
 
+# -------------------------------------------------------------- test tools
+
+def ensure_swiftshader(spec, deps_dir, check_only=False):
+    """SwiftShader (a CPU Vulkan device) for tests/nv2a_vk_backend: the npm
+    tarball verified by SHA-256, the brotli'd tar inside it verified, and the
+    two libraries unpacked from that verified again."""
+    out_dir = os.path.join(deps_dir, "tools", "swiftshader")
+    icd = os.path.join(out_dir, spec["icd"])
+
+    def unpacked_ok():
+        return os.path.exists(icd) and all(
+            os.path.exists(os.path.join(out_dir, f)) and sha256_file(os.path.join(out_dir, f)) == h
+            for f, h in spec["files_sha256"].items())
+
+    if unpacked_ok():
+        log("swiftshader present and verified")
+        return {"path": icd, "dir": out_dir, "version": spec["version"]}
+    if check_only:
+        raise DepError("swiftshader not fetched")
+    try:
+        import brotli
+    except ImportError:
+        raise DepError("swiftshader needs the brotli module: python3 -m pip install "
+                       "--require-hashes -r tools/android/requirements-dev.txt")
+    dl = os.path.join(deps_dir, "downloads", os.path.basename(spec["url"]))
+    download_verified(spec["url"], dl, spec["sha256"])
+    with tarfile.open(dl, "r:gz") as t:
+        packed = t.extractfile(t.getmember(spec["member"])).read()
+    if hashlib.sha256(packed).hexdigest() != spec["member_sha256"]:
+        raise DepError("swiftshader: %s does not match its pinned SHA-256" % spec["member"])
+    os.makedirs(out_dir, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(brotli.decompress(packed))) as t:
+        for m in t.getmembers():
+            name = os.path.basename(m.name)
+            if m.isfile() and (name in spec["files_sha256"] or name == spec["icd"]):
+                with open(os.path.join(out_dir, name), "wb") as f:
+                    f.write(t.extractfile(m).read())
+    if not unpacked_ok():
+        raise DepError("swiftshader: unpacked libraries do not match their pinned SHA-256")
+    log("swiftshader unpacked and verified in %s" % out_dir)
+    return {"path": icd, "dir": out_dir, "version": spec["version"]}
+
+
 # -------------------------------------------------------------------- main
 
 def write_env(deps_dir, manifest):
@@ -350,6 +394,11 @@ def write_env(deps_dir, manifest):
     gr = manifest.get("gradle")
     if gr:
         lines.append("export XBOXRECOMP_GRADLE=%s" % gr["gradle"])
+    ss = (manifest.get("test_tools") or {}).get("swiftshader")
+    if ss:
+        # Not exported as VK_ICD_FILENAMES: only the Vulkan test opts in.
+        lines.append("export XBOXRECOMP_SWIFTSHADER_ICD=%s" % ss["path"])
+        lines.append("export XBOXRECOMP_SWIFTSHADER_DIR=%s" % ss["dir"])
     path = os.path.join(deps_dir, "android-env.sh")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -361,7 +410,8 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--deps-dir", default=os.environ.get("XBOXRECOMP_ANDROID_DEPS", DEFAULT_DEPS))
     ap.add_argument("--only", default="git,sdk,gradle,python",
-                    help="comma list of: git, git-dev, sdk, gradle, python, python-dev, archives")
+                    help="comma list of: git, git-dev, sdk, gradle, python, python-dev, "
+                         "archives, test-vk")
     ap.add_argument("--check", action="store_true", help="verify only; fetch nothing")
     ap.add_argument("--lock", default=LOCK)
     args = ap.parse_args(argv)
@@ -413,6 +463,16 @@ def main(argv=None):
                 continue
             try:
                 manifest["archives"][name] = ensure_archive(name, spec, deps_dir, args.check)
+            except DepError as e:
+                errors.append(str(e))
+    if "test-vk" in only:
+        spec = (lock.get("test_tools") or {}).get("swiftshader")
+        if spec and not (sys.platform.startswith("linux") and os.uname().machine == "x86_64"):
+            log("swiftshader: skipped (only for %s)" % spec.get("host"))
+        elif spec:
+            try:
+                manifest.setdefault("test_tools", {})["swiftshader"] = \
+                    ensure_swiftshader(spec, deps_dir, args.check)
             except DepError as e:
                 errors.append(str(e))
     if "gradle" in only:

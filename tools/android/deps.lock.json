@@ -98,5 +98,24 @@
       "license": "Apache-2.0",
       "used_for": "<android/log.h> for the compile-only check (the NDK sysroot ships the same public header; AOSP's own repository is not on GitHub, LineageOS mirrors it). Never linked."
     }
+  },
+  "test_tools": {
+    "comment": "Test-only tools, never part of a build or an APK. python3 -m tools.android.fetch_deps --only test-vk",
+    "swiftshader": {
+      "what": "SwiftShader: a Vulkan 1.3 device on the CPU (Google, Apache-2.0), with the Khronos loader, as bundled by the npm package @sparticuz/chromium. It runs tests/nv2a_vk_backend where there is no GPU (CI, this sandbox).",
+      "version": "@sparticuz/chromium@153.0.0 (SwiftShader 5.0.0)",
+      "url": "https://registry.npmjs.org/@sparticuz/chromium/-/chromium-153.0.0.tgz",
+      "sha256": "20e5656fcdcf4118ede85edfb9d6bb9cc1bbb7ffb8b75622fffbcf36a835c3c0",
+      "npm_integrity": "sha512-jiGWqSvPMdu4+P9TilYqAR7yEGPEHINx+lCvE/NqNO/EHYzF/x1hUiI5T6ioVIt7dEy7n88byyT0vk+dnsgQwA==",
+      "member": "package/bin/swiftshader.tar.br",
+      "member_sha256": "b680e40a33235ecc6ad4c6897a168b70ce5164f0d62d2a64d675320d51614631",
+      "unpack": "brotli, then tar",
+      "files_sha256": {
+        "libvk_swiftshader.so": "2f3ceffaaca7d031bc3943f8eacf398a5d9c42c5fe0d15d8840b9acfa630b58e",
+        "libvulkan.so.1": "8ee5ac00fd7968e863b05e0f6808057db16a00ad322777e5a05bed51d4f84085"
+      },
+      "icd": "vk_swiftshader_icd.json",
+      "host": "linux-x86_64"
+    }
   }
 }

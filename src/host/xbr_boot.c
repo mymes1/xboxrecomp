@@ -22,6 +22,9 @@
 
 #include "kernel/xbox_memory_layout.h"
 #include "kernel/kernel.h"
+#if XBR_HAVE_VULKAN
+#include "nv2a_vk.h"            /* src/vk: the NV2A render back end on Vulkan */
+#endif
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
@@ -323,6 +326,26 @@ int xbr_boot_run(const XbrBootOptions *o)
         if (entry < 0x10000 || entry >= 0x10000000)
             entry = raw;
     }
+
+    /* The pushbuffer executor draws with a render back end when one is
+     * registered, else with its CPU rasteriser. Vulkan unless RECOMP_VK=0;
+     * any failure to bring it up leaves the CPU rasteriser drawing, and the
+     * line below says which renderer runs and why. */
+    stage("render back end");
+#if XBR_HAVE_VULKAN
+    {
+        const char *v = getenv("RECOMP_VK");
+        if (v && !strcmp(v, "0"))
+            printf("[BOOT] render: cpu (RECOMP_VK=0)\n");
+        else if (nv2a_vk_register() == 0)
+            printf("[BOOT] render: vulkan (%s)\n", nv2a_vk_status());
+        else
+            printf("[BOOT] render: cpu (Vulkan %s)\n", nv2a_vk_status());
+    }
+#else
+    printf("[BOOT] render: cpu (built without the Vulkan back end)\n");
+#endif
+    fflush(stdout);
 
     stage("dispatch table");
     if (!recomp_dispatch_init())

@@ -116,6 +116,16 @@ class BootLogTest(unittest.TestCase):
         self.assertEqual(len(r["unimpl"]), 1)
         self.assertEqual(r["status"][1]["display"], "0x83E00000")
 
+    def test_render_line(self):
+        r = native.parse_boot_log(
+            "[BOOT] render: vulkan (Vulkan 1.3.0 on Mali-G57 MC2 (integrated GPU), depth D24S8)\n")
+        self.assertEqual(r["render"]["backend"], "vulkan")
+        self.assertTrue(r["render"]["detail"].startswith("Vulkan 1.3.0 on Mali-G57"))
+        r = native.parse_boot_log("[BOOT] render: cpu (Vulkan off: no Vulkan loader (x))\n")
+        self.assertEqual(r["render"]["backend"], "cpu")
+        self.assertIn("no Vulkan loader", r["render"]["detail"])
+        self.assertNotIn("render", native.parse_boot_log(BOOT_LOG))
+
     def test_failed_boot(self):
         r = native.parse_boot_log("[BOOT] read XBE\n[BOOT] FAILED: cannot read an XBE at x\n")
         self.assertFalse(r["entry_reached"])

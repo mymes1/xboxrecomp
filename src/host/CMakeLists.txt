@@ -30,4 +30,9 @@ target_include_directories(xboxrecomp_host PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../kernel
 )
 target_link_libraries(xboxrecomp_host PUBLIC xboxrecomp ${CMAKE_DL_LIBS})
+# The Vulkan back end, when the game project added src/vk first (it defines
+# XBR_HAVE_VULKAN for xbr_boot.c, which registers it).
+if(TARGET xboxrecomp_vk)
+    target_link_libraries(xboxrecomp_host PUBLIC xboxrecomp_vk)
+endif()
 target_compile_options(xboxrecomp_host PRIVATE -Wall -Wextra -Wno-unused-parameter)

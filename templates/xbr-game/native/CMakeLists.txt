@@ -25,6 +25,16 @@ set(XBR_SDL2_SOURCE_DIR "" CACHE PATH "SDL2 source (Android)")
 set(XBR_GAME_NAME "xbr_game" CACHE STRING "desktop executable name")
 set(XBR_GEN_OPT "" CACHE STRING "extra compile options for the generated C only")
 option(XBR_COMPILE_CHECK "compile every source for the target, link nothing" OFF)
+# The NV2A render back end on Vulkan (src/vk), registered at boot unless
+# RECOMP_VK=0. On for Android (and its compile check); a desktop build may
+# turn it on too -- the loader is opened at run time, so a machine without
+# Vulkan still runs, on the CPU rasteriser.
+if(ANDROID OR XBR_COMPILE_CHECK)
+    set(_xbr_vulkan_default ON)
+else()
+    set(_xbr_vulkan_default OFF)
+endif()
+option(XBR_VULKAN "build in the Vulkan render back end (src/vk)" ${_xbr_vulkan_default})
 if(NOT XBR_TOOLKIT_DIR OR NOT EXISTS "${XBR_TOOLKIT_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "XBR_TOOLKIT_DIR must point at the xboxrecomp checkout")
 endif()
@@ -58,6 +68,14 @@ elseif(ANDROID)
 endif()
 
 add_subdirectory(${XBR_TOOLKIT_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
+if(XBR_VULKAN)
+    add_subdirectory(${XBR_TOOLKIT_DIR}/src/vk ${CMAKE_BINARY_DIR}/xboxrecomp_vk)
+    if(NOT TARGET xboxrecomp_vk)
+        message(FATAL_ERROR "XBR_VULKAN=ON needs vulkan/vulkan.h: run "
+                "`python3 -m tools.android.fetch_deps --only git` or set "
+                "XBOXRECOMP_VULKAN_HEADERS_DIR (or configure with -DXBR_VULKAN=OFF)")
+    endif()
+endif()
 add_subdirectory(${XBR_TOOLKIT_DIR}/src/host ${CMAKE_BINARY_DIR}/xboxrecomp_host)
 
 file(GLOB XBR_GEN_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gen/*.c")

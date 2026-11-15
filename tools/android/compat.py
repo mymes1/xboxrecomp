@@ -119,7 +119,8 @@ def _host_summary(r):
     if not r:
         return None
     keep = ("platform", "entry_reached", "title_returned", "exit", "seconds", "flips",
-            "display_changes", "display_set", "selftest", "display_bmp", "log", "failed_step", "note")
+            "display_changes", "display_set", "selftest", "display_bmp", "log", "failed_step", "note",
+            "render")
     out = {k: r.get(k) for k in keep if k in r}
     out["crash"] = r.get("crash", [])[:20]
     out["unimpl_reached"] = r.get("unimpl", [])[:20]
@@ -199,6 +200,11 @@ def to_markdown(r):
         for k in ("device", "entry_reached", "flips", "display_changes", "exit", "selftest"):
             if k in rt:
                 out.append("- %s: %s" % (k, rt.get(k)))
+        if rt.get("render"):
+            # Which renderer drew: the Vulkan back end, or the CPU rasteriser
+            # (and why). A booted title on the CPU rasteriser is still booted.
+            out.append("- renderer: %s (%s)" % (rt["render"].get("backend"),
+                                                rt["render"].get("detail")))
         for line in rt.get("crash", [])[:12]:
             out.append("    %s" % line)
         for line in rt.get("title_lines", [])[:40]:
