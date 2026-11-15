@@ -19,19 +19,21 @@ Target device for tuning: Samsung Galaxy Tab A9 (Mali-G57 MC2), Android 15.
 
 ## Status (honest)
 
-Each phase lists what exists and what has been *demonstrated*. "Compiled" is
-never reported as "works".
+Each phase lists what exists and what has been *demonstrated*, and on what.
+"Compiled" is never reported as "works". Everything below was shown on the
+self-built test title (`tools/android/testtitle`, no game content); no
+commercial title and no physical Android device have been run yet.
 
 | Phase | Scope | State |
 |---|---|---|
-| 1 | Inspection, dependency automation | **Done**: [INSPECTION.md](INSPECTION.md); pinned and verified inputs ([DEPENDENCIES.md](DEPENDENCIES.md)) |
-| 2 | ISO download/verify/extract, XBE analysis, game project | intake/analyze/recompile stages work on the self-built test title (`python3 -m pytest tools/android`); the game-project stage arrives with Phase 4 |
-| 3 | ARM64 code generation | in progress: the whole `lock` family lowers atomically (was RECOMP_UNIMPL); generated C compiles for aarch64 (zig, locally); NDK build runs in CI |
-| 4 | Android kernel/runtime | not started |
-| 5 | Vulkan back end | not started |
-| 6 | Audio, input, assets | not started |
-| 7 | APK packaging, launcher | not started |
-| 8 | Device testing, Mali tuning | not started |
+| 1 | Inspection, dependency automation | **Done**: [INSPECTION.md](INSPECTION.md); every input pinned and verified ([DEPENDENCIES.md](DEPENDENCIES.md)) |
+| 2 | ISO download/verify/extract, XBE analysis, game project | **Done** as pipeline stages: intake (path or URL, SHA-256 and/or SHA-1, XISO detection, extraction, `default.xbe`), analysis, per-game project. Demonstrated on the test title |
+| 3 | ARM64 code generation | generated C plus runtime build with the NDK for arm64-v8a (CI) and run natively on Linux arm64 (CI: test title self-test 8/8). The `lock` family lowers atomically |
+| 4 | Android kernel/runtime | test title: **Runtime initialized** and **Game booted** on the Android emulator, whose ARM translation runs the arm64 code (self-test 8/8, the title's own frames on the scanout). Not yet on a physical device |
+| 5 | Vulkan back end | in the tree (`src/vk`), built into `libmain.so`, registered at boot, CPU-rasteriser fallback. Translates the executor's draws: register combiners, four texture stages, blending, depth, stencil, alpha test, colour mask, 16-bit and swizzled surfaces, render to texture. **Matches the CPU rasteriser on SwiftShader** (9 scenes; CI job *vulkan-backend*). Not yet run on a phone GPU. Frames still reach the screen through the SDL presenter: there is no Vulkan swapchain presenter yet |
+| 6 | Audio, input, assets | game files are packaged in the APK and installed to app storage on first start. Audio output, touch controls, controllers and pause/resume: not started |
+| 7 | APK packaging, launcher | APK built, signed and verified in CI (arm64-v8a only, 16 KB-aligned libraries, required symbols present, game files complete), with a launcher activity |
+| 8 | Device testing, Mali tuning | not started: needs the Galaxy Tab A9 (Mali-G57) |
 
 Compatibility levels used throughout the reports:
 
@@ -81,6 +83,52 @@ In GitHub Actions, start *Android pipeline* by hand with `iso_url` plus
 with `XBR_ISO_SHA256` and/or `XBR_ISO_SHA1`. The inputs and the secrets are
 each used as a complete set: with `iso_url` given, no digest is taken from
 the secrets.
+
+## Install and build
+
+Needs Linux x86-64, Python 3.10 or newer and git. Everything else is pinned
+in `tools/android/deps.lock.json` and verified by SHA-256 (or a pinned git
+commit) when it is fetched:
+
+```
+bash tools/android/bootstrap.sh              # Python packages, sources, glslang, Gradle, SDK + NDK
+source build/android-deps/android-env.sh
+python3 -m tools.android.pipeline run --work build/games/mygame \
+    --source /path/to/game.iso --sha1 <40 hex digits>
+adb install build/games/mygame/out/<package>-<version>.apk
+```
+
+`reports/compatibility.md` in the work directory says what was demonstrated
+for that title and on what. `python3 -m tools.android.device_run --work
+build/games/mygame` installs the APK on a connected device, runs it and
+records the boot log, the renderer in use and the frames it presented.
+
+## Testing the Vulkan back end
+
+`tests/nv2a_vk_backend` draws eight scenes twice, with the executor's CPU
+rasteriser and with the Vulkan back end, and compares the framebuffers; a
+ninth (stencil) is checked against the expected pixels. Without a GPU,
+SwiftShader (pinned) is the Vulkan device:
+
+```
+bash tools/android/bootstrap.sh --no-sdk --no-gradle --vk-test
+source build/android-deps/android-env.sh
+cmake -S tests/nv2a_vk_backend -B build/tests/nv2a_vk_backend -G Ninja
+cmake --build build/tests/nv2a_vk_backend
+VK_ICD_FILENAMES=$XBOXRECOMP_SWIFTSHADER_ICD LD_LIBRARY_PATH=$XBOXRECOMP_SWIFTSHADER_DIR \
+    ./build/tests/nv2a_vk_backend/nv2a-vk-backend-test
+```
+
+SwiftShader compiles each pipeline in software, so the run takes a few
+minutes. `RECOMP_VK_TEST_OUT=<dir>` writes both renderings of every scene as
+PPM files. After editing `src/vk/shaders/*`, regenerate the embedded SPIR-V
+with `python3 -m tools.android.vk_shaders` (CI checks it with `--check`).
+
+On a device, the boot log names the renderer: `[BOOT] render: vulkan (...)`
+with the GPU and driver, or `[BOOT] render: cpu (...)` with the reason. Set
+`RECOMP_VK=0` to compare against the CPU rasteriser, and `RECOMP_VK_STATS=60`
+for counters and per-pipeline build times
+([environment variables](../runtime/environment-variables.md#graphics-vulkan-back-end)).
 
 ## Legal
 

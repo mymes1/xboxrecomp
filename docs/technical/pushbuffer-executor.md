@@ -221,10 +221,49 @@ of the code here:
   from the projected, mirrored one. Decide culling per triangle from the
   projected screen positions and draw with the rasteriser's culling off.
 
-Not passed on yet: the register-combiner state, and texture stages 1–3 (a back
-end sees stage 0 and the diffuse colour), so effects that need a second stage
-or a combiner program only appear on the CPU rasteriser. Extend `Nv2aBatch`
-when it matters rather than adding callbacks.
+`draw` sees texture stage 0 and the diffuse colour only. A back end that runs
+the whole pixel pipeline uses the extended form instead.
+
+### Extended Batches
+
+*[android-port]* A back end may set `draw_ex` and `clear_ex`; when set they are
+called instead of `draw` and `clear`, and a back end that leaves them NULL sees
+no change. `Nv2aBatchEx` carries everything the CPU rasteriser itself reads
+(`xf_rows`), so a GPU can produce the same pixels:
+
+- per vertex (`Nv2aVertexEx`): position in surface pixels with the window z and
+  the clip-space w, `d0`, `d1`, the fog unit's factor, and the four texture
+  coordinate sets as the program wrote them;
+- the four texture stages (`Nv2aStage`): palette, border colour, cube faces, and
+  whether the coordinates are normalised (swizzled, DXT) or texels (linear);
+- the register-combiner program (`Nv2aCombiner`), and `use_rc` / `textured`
+  exactly as the executor chooses between its two pixel paths;
+- the fog colour (R in bits 0–7) and `SET_SHADER_CLIP_PLANE_MODE`;
+- `screen_space` for batches from the screen-space path, which
+  `raster_triangle` draws with no depth, alpha test or combiners; the executor
+  shapes those vertices (flat colour, w = 1) so that the rule above reproduces
+  it.
+
+`clear_ex` also gets the surface format and the rectangle the CPU path clears
+(the clip, or `CLEAR_RECT` on a swizzled surface).
+`nv2a_backend_decode_stage` decodes one face of a stage, palettes included, and
+`nv2a_backend_stage_bytes` gives the guest bytes the stage spans, which a back
+end hashes to notice a rewritten texture.
+
+`src/vk/nv2a_vk.c` uses this interface: it is the Vulkan back end of the Android
+port. `tests/nv2a_vk_backend` draws the same pushbuffers with it and with the CPU
+rasteriser and compares the framebuffers. Where the two can legitimately
+disagree:
+
+- **Coverage on an edge.** `xf_rows` fills a pixel whose centre lies exactly on
+  an edge for both triangles that share it; a GPU fills it for one (the top-left
+  rule). Only edge pixels differ, and only under blending does it show.
+- **A sample exactly on a texel boundary.** Either texel is right, and float
+  rounding picks one; the test's coordinates avoid round ratios for that reason.
+- **Blending on a 16-bit surface.** The CPU path keeps 5:6:5 between draws; the
+  Vulkan back end draws in 8:8:8:8 and truncates as `put_pixel` does when it
+  writes back, so the results are identical without blending and can differ by
+  a 5- or 6-bit step with it.
 
 ## Switches
 
@@ -235,7 +274,7 @@ when it matters rather than adding callbacks.
 | `RECOMP_PB_WALK=dma` | walk the pushbuffer like the DMA engine (JUMPs, wraps, GET per command, the `0x0310` latch) instead of scanning each submitted segment; see [The DMA Walk Is Opt-In](#the-dma-walk-is-opt-in) |
 | `RECOMP_PB_EXEC_VERBOSE` | per-batch trace |
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
-| `RECOMP_TEX_BILINEAR` | the CPU rasteriser blends the four nearest texels of every textured pixel instead of taking the nearest one, whatever `SET_TEXTURE_FILTER` asked for. All three sampling paths: pixel-position batches, the perspective path and the register-combiner stages. Off by default: nearest texel. No mip levels, so a minified texture is not blurred by level. A GPU back end has its own filtering and is not affected |
+| `RECOMP_TEX_BILINEAR` | the CPU rasteriser blends the four nearest texels of every textured pixel instead of taking the nearest one, whatever `SET_TEXTURE_FILTER` asked for. All three sampling paths: pixel-position batches, the perspective path and the register-combiner stages. Off by default: nearest texel. No mip levels, so a minified texture is not blurred by level. The Vulkan back end (`src/vk`) follows it too, so the two renderers agree |
 | `RECOMP_TEX_ANISO` | `8` or `16`: anisotropic filtering on the CPU rasteriser, implies `RECOMP_TEX_BILINEAR`. Up to that many bilinear taps along the longer of a pixel's two texel gradients, so a floor or wall seen at a slant averages along its stretched axis instead of aliasing. Any other value leaves it off. Gradients are exact per triangle for pixel-position batches and taken one pixel over on the perspective path, which costs two more texture-coordinate evaluations per pixel, so it is slower. No mip levels. Off by default |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
 | `RECOMP_STRIP_ALT_WINDING` | emit every odd triangle of a triangle strip with its first two vertices swapped, so all of a strip's triangles wind the same way, as a strip does on hardware. Off by default: the executor emits `(i, i+1, i+2)` for every `i`. A back end that culls, or lights two-sided, from the winding drops or back-lights every second strip triangle without it |

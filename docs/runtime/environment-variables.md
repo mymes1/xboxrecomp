@@ -98,8 +98,8 @@ The executor is itself opt-in: set `RECOMP_PB_EXEC=1` to execute the pushbuffer.
 | `RECOMP_NO_COMBINERS` | off | Skips the register combiners. | `nv2a_pb_exec.c` |
 | `RECOMP_NO_VSH` | off | Skips vertex programs. | `nv2a_pb_exec.c` |
 | `RECOMP_RASTER_THREADS=N` | auto | Worker threads for the software rasteriser, on Windows and POSIX. | `nv2a_pb_exec.c` |
-| `RECOMP_TEX_BILINEAR=1` | off | CPU rasteriser blends the four nearest texels instead of taking the nearest. | `nv2a_pb_exec.c` |
-| `RECOMP_TEX_ANISO=8\|16` | off | Anisotropic filtering on the CPU rasteriser; implies `RECOMP_TEX_BILINEAR`. Slower. | `nv2a_pb_exec.c` |
+| `RECOMP_TEX_BILINEAR=1` | off | CPU rasteriser blends the four nearest texels instead of taking the nearest. The Vulkan back end follows it too. | `nv2a_pb_exec.c`, `src/vk/nv2a_vk.c` |
+| `RECOMP_TEX_ANISO=8\|16` | off | Anisotropic filtering on the CPU rasteriser; implies `RECOMP_TEX_BILINEAR`. Slower. The Vulkan back end treats it as bilinear. | `nv2a_pb_exec.c`, `src/vk/nv2a_vk.c` |
 | `RECOMP_STRIP_ALT_WINDING` | off | Odd triangles of a strip keep the strip's winding, as on hardware. | `nv2a_pb_exec.c` |
 | `RECOMP_PB_CONST_FAST=0` | on | Sends every `SET_TRANSFORM_CONSTANT` word through the general dispatcher. | `nv2a_pb_exec.c` |
 | `RECOMP_RASTER_TEST` | off | Bring-up aid: draws a magenta triangle after every clear, to prove the rasteriser and presenter work. | `nv2a_pb_exec.c` |
@@ -115,6 +115,19 @@ The executor is itself opt-in: set `RECOMP_PB_EXEC=1` to execute the pushbuffer.
 | `RECOMP_FB_DUMP_FLIPS` | off | `1` dumps every flip; any other value names a file whose existence turns dumping on. | `nv2a_pb_exec.c` |
 | `RECOMP_FIND_NAN` | off | Scans for NaN matrices at every report. | `nv2a_pb_exec.c` |
 | `RECOMP_FIND_QUAD` | off | Scans once for quad vertices. | `nv2a_pb_exec.c` |
+
+## Graphics: Vulkan back end
+
+*[android-port]* `src/vk` draws what the pushbuffer executor decodes with Vulkan instead of the CPU rasteriser; see [Pushbuffer Executor, Extended Batches](../technical/pushbuffer-executor.md#extended-batches). It is built into Android titles (`XBR_VULKAN`, on for Android) and registered at boot. The boot log says which renderer runs: `[BOOT] render: vulkan (<device>)` or `[BOOT] render: cpu (<why>)`. Any failure to bring Vulkan up, and any Vulkan error later, leaves the CPU rasteriser drawing.
+
+| Variable | Default | What it does | Where |
+|---|---|---|---|
+| `RECOMP_VK=0` | on when built in | Do not register the Vulkan back end: the CPU rasteriser draws. | `src/host/xbr_boot.c` |
+| `RECOMP_VK_DEVICE=N` | first GPU | Physical device index (else the first integrated or discrete GPU, then any device with a graphics queue and the colour and depth formats). | `src/vk/nv2a_vk.c` |
+| `RECOMP_VK_CULL=1` | off | Honour the title's cull state. Off because the executor emits every second strip triangle with the opposite winding unless `RECOMP_STRIP_ALT_WINDING` is set, and the facing convention is not yet verified against hardware. The CPU rasteriser never culls. | `src/vk/nv2a_vk.c` |
+| `RECOMP_VK_STATS=N` | off | `[VK]` counters every N flips, and the build time of every pipeline (one per combiner program: the shader-compile stutter on a phone). | `src/vk/nv2a_vk.c` |
+| `RECOMP_VK_VALIDATION=1` | off | Enable `VK_LAYER_KHRONOS_validation` when it is installed. | `src/vk/nv2a_vk.c` |
+| `RECOMP_VK_LIB=<path>` | `libvulkan.so` (Android), `libvulkan.so.1` | The Vulkan loader to open. | `src/vk/nv2a_vk.c` |
 
 ## Video output
 
