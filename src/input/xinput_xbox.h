@@ -114,6 +114,13 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
  * active, and keeps SDL alive at shutdown while controller handles are open. */
 void xbox_InputSetMainPump(int on);
 int xbox_InputAnyOpen(void);
+
+/* [android-port] An on-screen pad (touch controls, src/host/android): merged
+ * into port 0 the way the keyboard is, so a real controller there keeps
+ * working, and port 0 reads as connected while it is shown. NULL hides it.
+ * Any thread. */
+void xbox_InputOverlaySet(const XBOX_GAMEPAD *pad);
+int xbox_InputOverlayActive(void);
 #endif
 
 #ifdef __cplusplus

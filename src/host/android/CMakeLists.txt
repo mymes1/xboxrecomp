@@ -9,10 +9,17 @@ endif()
 add_library(xboxrecomp_android OBJECT
     xbr_android_main.c
     xbr_android_log.c
+    xbr_android_input.c
 )
 target_include_directories(xboxrecomp_android PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+# xbr_android_input.c: the input layer's overlay pad (xinput_xbox.h, which
+# includes platform/xbox_winnt.h from src/).
+target_include_directories(xboxrecomp_android PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../input
+    ${CMAKE_CURRENT_SOURCE_DIR}/../..
 )
 target_link_libraries(xboxrecomp_android PUBLIC SDL2::SDL2 log android)
 target_compile_options(xboxrecomp_android PRIVATE -Wall -Wextra -Wno-unused-parameter)

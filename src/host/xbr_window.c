@@ -22,16 +22,22 @@
  *
  * Log lines: "[BOOT] present: vulkan (<swapchain>)" or "[BOOT] present: sdl
  * (<why>)"; "[HOST] background ..." / "[HOST] foreground ...".
+ *
+ * RECOMP_INPUT_TRACE=1: "[INPUT] port 0: ..." whenever what controller port 0
+ * reports changes (polled at 20 Hz through xbox_InputGetState, the call the
+ * emulated USB pad reads) -- controllers, keyboard and on-screen controls.
  */
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <SDL.h>
 
 #include "xbr_host.h"
 #include "video/fb_present_ext.h"
+#include "input/xinput_xbox.h"
 
 #ifdef XBR_HAVE_VULKAN
 #include <SDL_vulkan.h>
@@ -152,10 +158,58 @@ static void vk_close(void)
 }
 #endif /* XBR_HAVE_VULKAN */
 
+/* ---- input trace (RECOMP_INPUT_TRACE) ------------------------------------------ */
+
+static void *input_trace_main(void *arg)
+{
+    XBOX_INPUT_STATE st, last;
+    DWORD rc, last_rc = 0xFFFFFFFFu;
+    (void)arg;
+    memset(&last, 0, sizeof last);
+    for (;;) {
+        struct timespec ts = { 0, 50 * 1000 * 1000 };
+        memset(&st, 0, sizeof st);
+        rc = xbox_InputGetState(0, &st);
+        if (rc != last_rc || (rc == 0 && memcmp(&st.Gamepad, &last.Gamepad, sizeof st.Gamepad))) {
+            const XBOX_GAMEPAD *g = &st.Gamepad;
+            if (rc != 0)
+                printf("[INPUT] port 0: not connected\n");
+            else
+                printf("[INPUT] port 0: buttons=0x%04X A=%u B=%u X=%u Y=%u BK=%u WH=%u LT=%u RT=%u"
+                       " L=(%d,%d) R=(%d,%d)\n", g->wButtons, g->bAnalogButtons[0],
+                       g->bAnalogButtons[1], g->bAnalogButtons[2], g->bAnalogButtons[3],
+                       g->bAnalogButtons[4], g->bAnalogButtons[5], g->bAnalogButtons[6],
+                       g->bAnalogButtons[7], g->sThumbLX, g->sThumbLY, g->sThumbRX, g->sThumbRY);
+            fflush(stdout);
+            last = st;
+            last_rc = rc;
+        }
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+/* Started from the event loop: SDL (and its game controllers) is up by then. */
+static void input_trace_start(void)
+{
+    static int started;
+    const char *e;
+    pthread_t th;
+    if (started)
+        return;
+    started = 1;
+    e = getenv("RECOMP_INPUT_TRACE");
+    if (!e || !*e || !strcmp(e, "0"))
+        return;
+    if (pthread_create(&th, NULL, input_trace_main, NULL) == 0)
+        pthread_detach(th);
+}
+
 /* ---- events -------------------------------------------------------------------- */
 
 static void on_event(const SDL_Event *ev)
 {
+    input_trace_start();
     switch (ev->type) {
     case SDL_APP_WILLENTERBACKGROUND:
 #ifdef XBR_HAVE_VULKAN

@@ -3,7 +3,7 @@ happened: reports/runtime_test.json, the evidence for "Runtime initialized"
 and "Game booted" in the compatibility report.
 
     python3 -m tools.android.device_run --work W [--seconds 60] [--serial S]
-                                        [--lifecycle]
+                                        [--lifecycle] [--touch]
 
 Installs <work>/out/<package>-<version>.apk, clears logcat, starts the
 launcher with AUTOSTART (it installs the game files and starts the game in
@@ -19,7 +19,11 @@ bars in order, the band beneath, black beside it (screen_check.py) -- which
 is what the presenter (the Vulkan swapchain, or the SDL renderer) actually
 put on the display. --lifecycle then sends the app to the background (HOME),
 checks the game process survives it and the runtime saw it, brings the task
-back the way the launcher icon does, and checks the screen again.
+back the way the launcher icon does, and checks the screen again. --touch
+drives the on-screen controller with `input swipe` at the positions it logs
+("[TOUCH] layout ...") and checks controller port 0 reports each control
+(RECOMP_INPUT_TRACE: "[INPUT] port 0: ..."): A held, the left stick pushed
+up and right, Start.
 """
 
 import argparse
@@ -94,6 +98,81 @@ def _game_log(adb):
     return adb.cmd("logcat", "-d", "-v", "raw", "-s", "xboxrecomp:*", check=False)
 
 
+_TOUCH_LAYOUT = re.compile(r"\[TOUCH\] layout (\d+)x(\d+) (.*)")
+_INPUT = re.compile(r"\[INPUT\] port 0: buttons=0x([0-9A-F]{4}) A=(\d+) B=(\d+) X=(\d+) Y=(\d+)"
+                    r" BK=(\d+) WH=(\d+) LT=(\d+) RT=(\d+) L=\((-?\d+),(-?\d+)\)"
+                    r" R=\((-?\d+),(-?\d+)\)")
+
+
+def parse_touch_layout(text):
+    """{name: (x, y, r)} from the last "[TOUCH] layout" line, or {}."""
+    found = _TOUCH_LAYOUT.findall(text)
+    if not found:
+        return {}
+    out = {}
+    for item in found[-1][2].split():
+        name, _, xyz = item.partition("=")
+        try:
+            x, y, r = (int(v) for v in xyz.split(","))
+        except ValueError:
+            continue
+        out[name] = (x, y, r)
+    return out
+
+
+def parse_inputs(text):
+    """Every "[INPUT] port 0" state line, as dicts."""
+    out = []
+    for m in _INPUT.finditer(text):
+        g = m.groups()
+        out.append({"buttons": int(g[0], 16), "A": int(g[1]), "B": int(g[2]), "X": int(g[3]),
+                    "Y": int(g[4]), "LT": int(g[7]), "RT": int(g[8]),
+                    "L": (int(g[9]), int(g[10])), "R": (int(g[11]), int(g[12]))})
+    return out
+
+
+def _touch(adb, log):
+    """Drive the on-screen controller and read what port 0 reports."""
+    out = {"checks": {}}
+    text = _game_log(adb)
+    ctl = parse_touch_layout(text)
+    out["controls_shown"] = "[TOUCH] controls shown" in text
+    if not ctl or not out["controls_shown"]:
+        out["verdict"] = ("FAILED: the on-screen controller %s" %
+                          ("logged no layout" if not ctl else "is not shown"))
+        log("touch: %s" % out["verdict"])
+        return out
+    out["layout"] = {k: list(v) for k, v in ctl.items()}
+
+    def after(fn, what):
+        n = len(parse_inputs(_game_log(adb)))
+        fn()
+        time.sleep(1.5)
+        new = parse_inputs(_game_log(adb))[n:]
+        out["checks"][what] = new[-6:]
+        return new
+
+    def hold(name, ms=1500):
+        x, y, _r = ctl[name]
+        adb.cmd("shell", "input", "swipe", str(x), str(y), str(x), str(y), str(ms), check=False)
+
+    def drag(name, fx, fy, ms=1500):
+        x, y, r = ctl[name]
+        adb.cmd("shell", "input", "swipe", str(x), str(y), str(int(x + fx * r)),
+                str(int(y + fy * r)), str(ms), check=False)
+
+    ok_a = any(s["A"] == 255 for s in after(lambda: hold("A"), "A"))
+    ok_ls = any(s["L"][0] > 12000 and s["L"][1] > 12000
+                for s in after(lambda: drag("LS", 0.9, -0.9), "left stick up-right"))
+    ok_start = any(s["buttons"] & 0x0010 for s in after(lambda: hold("START"), "START"))
+    out["passed"] = {"A": ok_a, "left stick": ok_ls, "START": ok_start}
+    good = ok_a and ok_ls and ok_start
+    out["verdict"] = ("passed: A, the left stick and Start each reached controller port 0" if good
+                      else "FAILED: %s" % ", ".join(k for k, v in out["passed"].items() if not v))
+    log("touch: %s" % out["verdict"])
+    return out
+
+
 def _lifecycle(adb, serial, pkg, log, selftest):
     """HOME, then back the way the launcher icon brings a task back."""
     out = {"steps": []}
@@ -104,9 +183,11 @@ def _lifecycle(adb, serial, pkg, log, selftest):
     text = _game_log(adb)
     saw_bg = text.count("[HOST] background") > before
     out["steps"].append({"step": "home", "game_alive": alive_bg, "runtime_saw_background": saw_bg})
-    # NEW_TASK to the task's root activity: "brought to the front" with the
-    # game still on top, as tapping the icon does (LauncherActivity is
-    # singleTop for this; singleTask would finish the game).
+    # The icon's intent (MAIN/LAUNCHER, NEW_TASK | RESET_TASK_IF_NEEDED) to
+    # the task's root activity: the task is brought to the front with the
+    # game still on top, as a tap on the icon does. That needs the root
+    # intent to match (the run starts the same way) and LauncherActivity
+    # not to be singleTask, which would take the intent and finish the game.
     front = adb.cmd("shell", "am", "start", "-W", "-a", "android.intent.action.MAIN",
                     "-c", "android.intent.category.LAUNCHER", "-f", "0x10200000",
                     "-n", "%s/%s" % (pkg, PKG_ACTIVITY), check=False, timeout=120)
@@ -131,7 +212,8 @@ def _lifecycle(adb, serial, pkg, log, selftest):
     return out
 
 
-def run(work, seconds=60, serial=None, extra_env=None, log=print, lifecycle=False):
+def run(work, seconds=60, serial=None, extra_env=None, log=print, lifecycle=False,
+        touch=False):
     with open(os.path.join(work, "project", "xbr_game.json"), encoding="utf-8") as f:
         cfg = json.load(f)
     apk = os.path.join(work, "out", "%s-%s.apk" % (cfg["package"], cfg["version_name"]))
@@ -172,8 +254,13 @@ def run(work, seconds=60, serial=None, extra_env=None, log=print, lifecycle=Fals
 
     adb.cmd("logcat", "-c", check=False)
     env = ["RECOMP_STATUS_SECS=2", "RECOMP_STATUS_BMP=display.bmp",
-           "RECOMP_KERNEL_LOG_BUDGET=400"] + list(extra_env or [])
-    adb.cmd("shell", "am", "start", "-W", "-n", "%s/%s" % (pkg, PKG_ACTIVITY),
+           "RECOMP_KERNEL_LOG_BUDGET=400"] + (["RECOMP_INPUT_TRACE=1", "XBR_TOUCH=on"]
+                                               if touch else []) + list(extra_env or [])
+    # Started the way the launcher icon starts it (MAIN/LAUNCHER): the task's
+    # root intent then matches the icon's, which is what lets --lifecycle
+    # bring the task back as a tap on the icon does.
+    adb.cmd("shell", "am", "start", "-W", "-a", "android.intent.action.MAIN",
+            "-c", "android.intent.category.LAUNCHER", "-n", "%s/%s" % (pkg, PKG_ACTIVITY),
             "--ez", "org.xboxrecomp.app.AUTOSTART", "true",
             "--esa", "org.xboxrecomp.app.ENV", ",".join(env), timeout=180)
     deadline = time.time() + seconds
@@ -190,6 +277,7 @@ def run(work, seconds=60, serial=None, extra_env=None, log=print, lifecycle=Fals
     early = native.parse_boot_log(_game_log(adb))
     selftest = bool(early.get("selftest")) and not early["crash"]
     screen = _screen(adb, serial, log, "running") if selftest else None
+    touch_rep = _touch(adb, log) if touch and pid_game and not early["crash"] else None
     life = None
     if lifecycle and pid_game and not early["crash"]:
         life = _lifecycle(adb, serial, pkg, log, selftest)
@@ -206,6 +294,8 @@ def run(work, seconds=60, serial=None, extra_env=None, log=print, lifecycle=Fals
     rep.update(parsed)
     if screen is not None:
         rep["screen_check"] = screen
+    if touch_rep is not None:
+        rep["touch_test"] = touch_rep
     if life is not None:
         rep["lifecycle_test"] = {k: v for k, v in life.items() if k != "screen_after_resume"}
         if "screen_after_resume" in life:
@@ -261,9 +351,12 @@ def main(argv=None):
     ap.add_argument("--env", action="append", default=[], help="NAME=VALUE for the runtime")
     ap.add_argument("--lifecycle", action="store_true",
                     help="send the app to the background and back, and check it survives")
+    ap.add_argument("--touch", action="store_true",
+                    help="drive the on-screen controller and check controller port 0 sees it")
     a = ap.parse_args(argv)
     try:
-        run(os.path.abspath(a.work), a.seconds, a.serial, a.env, lifecycle=a.lifecycle)
+        run(os.path.abspath(a.work), a.seconds, a.serial, a.env, lifecycle=a.lifecycle,
+            touch=a.touch)
     except DeviceError as e:
         print("error: %s" % e, file=sys.stderr)
         return 1

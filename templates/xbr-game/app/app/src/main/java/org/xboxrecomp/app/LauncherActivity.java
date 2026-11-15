@@ -23,6 +23,8 @@ import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
@@ -226,6 +228,16 @@ public class LauncherActivity extends Activity {
         apu.setText(getString(R.string.opt_apu));
         apu.setChecked(p.getBoolean("apu", false));
         box.addView(apu);
+        final RadioGroup touch = choice(box, getString(R.string.opt_touch),
+                new String[] { "auto", "on", "off" },
+                new String[] { getString(R.string.touch_auto), getString(R.string.touch_on),
+                               getString(R.string.touch_off) },
+                p.getString("touch", "auto"));
+        final RadioGroup aspect = choice(box, getString(R.string.opt_aspect),
+                new String[] { "4:3", "16:9", "stretch" },
+                new String[] { getString(R.string.aspect_43), getString(R.string.aspect_169),
+                               getString(R.string.aspect_stretch) },
+                p.getString("aspect", "4:3"));
         final EditText extra = new EditText(this);
         extra.setHint(getString(R.string.opt_extra_hint));
         extra.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
@@ -234,20 +246,59 @@ public class LauncherActivity extends Activity {
         box.addView(extra);
         new AlertDialog.Builder(this)
                 .setTitle(getString(R.string.options))
-                .setView(box)
+                .setView(scrolling(box))
                 .setPositiveButton(android.R.string.ok, (d, w) -> p.edit()
                         .putBoolean("vsync", vsync.isChecked())
                         .putBoolean("apu", apu.isChecked())
+                        .putString("touch", chosen(touch, "auto"))
+                        .putString("aspect", chosen(aspect, "4:3"))
                         .putString("extra", extra.getText().toString())
                         .apply())
                 .setNegativeButton(android.R.string.cancel, null)
                 .show();
     }
 
+    private View scrolling(View v) {
+        ScrollView sv = new ScrollView(this);
+        sv.addView(v);
+        return sv;
+    }
+
+    /** A titled group of radio buttons; each button's tag is its value. */
+    private RadioGroup choice(LinearLayout box, String title, String[] values, String[] labels,
+                              String current) {
+        TextView t = new TextView(this);
+        t.setText(title);
+        t.setPadding(0, dp(12), 0, dp(2));
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        box.addView(t);
+        RadioGroup g = new RadioGroup(this);
+        g.setOrientation(RadioGroup.VERTICAL);
+        for (int i = 0; i < values.length; i++) {
+            RadioButton r = new RadioButton(this);
+            r.setText(labels[i]);
+            r.setTag(values[i]);
+            r.setId(View.generateViewId());
+            g.addView(r);
+            if (values[i].equals(current)) {
+                r.setChecked(true);
+            }
+        }
+        box.addView(g);
+        return g;
+    }
+
+    private static String chosen(RadioGroup g, String def) {
+        View v = g.findViewById(g.getCheckedRadioButtonId());
+        return v != null && v.getTag() != null ? v.getTag().toString() : def;
+    }
+
     private String[] runtimeEnv() {
         SharedPreferences p = prefs();
         ArrayList<String> env = new ArrayList<>();
         env.add("RECOMP_PRESENT_VSYNC=" + (p.getBoolean("vsync", true) ? "1" : "0"));
+        env.add("XBR_TOUCH=" + p.getString("touch", "auto"));
+        env.add("RECOMP_ASPECT=" + p.getString("aspect", "4:3"));
         if (p.getBoolean("apu", false)) {
             env.add("RECOMP_AC97_READY=1");
         }

@@ -14,6 +14,18 @@
     <string name="crashed">The game stopped unexpectedly. The log below says where.</string>
     <string name="no_log">No log yet: the game has not been started.</string>
     <string name="opt_vsync">Wait for the display (vsync)</string>
-    <string name="opt_apu">Emulated audio processor (APU)</string>
+    <string name="opt_apu">Sound (emulated audio processor; some games stall with it)</string>
+    <string name="opt_touch">On-screen controller</string>
+    <string name="touch_auto">When no controller is connected</string>
+    <string name="touch_on">Always</string>
+    <string name="touch_off">Never</string>
+    <string name="opt_aspect">Picture</string>
+    <string name="aspect_43">4:3, as on a TV of the time</string>
+    <string name="aspect_169">16:9 (for games set to widescreen)</string>
+    <string name="aspect_stretch">Fill the screen</string>
+    <string name="quit_title">Quit the game?</string>
+    <string name="quit_message">Progress since the last save is lost.</string>
+    <string name="quit_yes">Quit</string>
+    <string name="quit_no">Keep playing</string>
     <string name="opt_extra_hint">More runtime settings, NAME=VALUE separated by spaces</string>
 </resources>

@@ -247,6 +247,77 @@ int main(void)
     CHECK(xbox_InputGetState(0, &state) == ERROR_SUCCESS);
     CHECK(atomic_load_explicit(&s_lock_balance, memory_order_relaxed) == 0);
 
+    /* [android-port] The on-screen pad (xbox_InputOverlaySet): port 0 only,
+     * merged over a real pad, connected on its own, gone when hidden. */
+    {
+        XBOX_GAMEPAD o;
+        DWORD p1, p2;
+
+        SDL_LockJoysticks();
+        s_controller.attached = 0;
+        s_device_count = 0;
+        SDL_UnlockJoysticks();
+        CHECK(xbox_InputGetState(0, &state) == ERROR_DEVICE_NOT_CONNECTED);
+        CHECK(!xbox_InputIsConnected(0));
+        CHECK(!xbox_InputOverlayActive());
+
+        memset(&o, 0, sizeof o);
+        o.wButtons = XBOX_GAMEPAD_START;
+        o.bAnalogButtons[XBOX_BUTTON_B] = 255;
+        o.sThumbLX = 12000;
+        o.sThumbLY = -7000;
+        xbox_InputOverlaySet(&o);
+        CHECK(xbox_InputOverlayActive());
+        memset(&state, 0, sizeof state);
+        CHECK(xbox_InputGetState(0, &state) == ERROR_SUCCESS);
+        CHECK(state.Gamepad.wButtons == XBOX_GAMEPAD_START);
+        CHECK(state.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 255);
+        CHECK(state.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
+        CHECK(state.Gamepad.sThumbLX == 12000 && state.Gamepad.sThumbLY == -7000);
+        CHECK(xbox_InputIsConnected(0));
+        CHECK(!xbox_InputIsConnected(1));
+        CHECK(xbox_InputGetState(1, &state) == ERROR_DEVICE_NOT_CONNECTED);
+        {
+            XBOX_INPUT_CAPABILITIES caps;
+            CHECK(xbox_InputGetCapabilities(0, 0, &caps) == ERROR_SUCCESS);
+        }
+
+        /* The packet number moves with the overlay, not without it. */
+        CHECK(xbox_InputGetState(0, &state) == ERROR_SUCCESS);
+        p1 = state.dwPacketNumber;
+        xbox_InputOverlaySet(&o);
+        CHECK(xbox_InputGetState(0, &state) == ERROR_SUCCESS);
+        CHECK(state.dwPacketNumber == p1);
+        o.bAnalogButtons[XBOX_BUTTON_X] = 255;
+        xbox_InputOverlaySet(&o);
+        CHECK(xbox_InputGetState(0, &state) == ERROR_SUCCESS);
+        p2 = state.dwPacketNumber;
+        CHECK(p2 != p1);
+
+        /* Over a real pad: its A stays, the overlay's B and stick add. */
+        SDL_LockJoysticks();
+        s_device_count = 1;
+        s_device_instance++;
+        SDL_UnlockJoysticks();
+        memset(&state, 0, sizeof state);
+        CHECK(xbox_InputGetState(0, &state) == ERROR_SUCCESS);
+        CHECK(state.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+        CHECK(state.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 255);
+        CHECK(state.Gamepad.sThumbLX == 12000);
+        CHECK(state.Gamepad.wButtons & XBOX_GAMEPAD_START);
+
+        /* Hidden, and no pad: port 0 is empty again. */
+        xbox_InputOverlaySet(NULL);
+        CHECK(!xbox_InputOverlayActive());
+        SDL_LockJoysticks();
+        s_controller.attached = 0;
+        s_device_count = 0;
+        SDL_UnlockJoysticks();
+        CHECK(xbox_InputGetState(0, &state) == ERROR_DEVICE_NOT_CONNECTED);
+        CHECK(!xbox_InputIsConnected(0));
+        CHECK(atomic_load_explicit(&s_lock_balance, memory_order_relaxed) == 0);
+    }
+
     if (!s_fail)
         puts("SDL controller hotplug: ok");
     return s_fail;

@@ -216,6 +216,8 @@ def to_markdown(r):
             if sc:
                 out.append("- %s: %s -- %s" % (label, "matches" if sc.get("ok") else "NO MATCH",
                                                sc.get("reason")))
+        if rt.get("touch_test"):
+            out.append("- on-screen controller: %s" % rt["touch_test"].get("verdict"))
         if rt.get("lifecycle_test"):
             lt = rt["lifecycle_test"]
             out.append("- background/foreground: %s" % lt.get("verdict"))

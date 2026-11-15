@@ -48,6 +48,78 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
     pState->dwPacketNumber = kb.dwPacketNumber;
 }
 
+/* [android-port] The on-screen pad (xinput_xbox.h). A copy under a lock:
+ * the touch view sets it from Android's UI thread, the guest reads it. */
+#if defined(_WIN32)
+#include <windows.h>
+static SRWLOCK g_overlay_lock = SRWLOCK_INIT;
+#define OVL_LOCK()   AcquireSRWLockExclusive(&g_overlay_lock)
+#define OVL_UNLOCK() ReleaseSRWLockExclusive(&g_overlay_lock)
+#else
+#include <pthread.h>
+static pthread_mutex_t g_overlay_lock = PTHREAD_MUTEX_INITIALIZER;
+#define OVL_LOCK()   pthread_mutex_lock(&g_overlay_lock)
+#define OVL_UNLOCK() pthread_mutex_unlock(&g_overlay_lock)
+#endif
+static XBOX_GAMEPAD g_overlay;
+static int g_overlay_on;
+static DWORD g_overlay_packet;
+
+void xbox_InputOverlaySet(const XBOX_GAMEPAD *pad)
+{
+    OVL_LOCK();
+    if (pad) {
+        if (!g_overlay_on || memcmp(&g_overlay, pad, sizeof g_overlay) != 0)
+            g_overlay_packet++;
+        g_overlay = *pad;
+        g_overlay_on = 1;
+    } else {
+        if (g_overlay_on)
+            g_overlay_packet++;
+        memset(&g_overlay, 0, sizeof g_overlay);
+        g_overlay_on = 0;
+    }
+    OVL_UNLOCK();
+}
+
+int xbox_InputOverlayActive(void)
+{
+    int on;
+    OVL_LOCK();
+    on = g_overlay_on;
+    OVL_UNLOCK();
+    return on;
+}
+
+#if !defined(_WIN32)
+/* As keyboard_merge: buttons add, analog takes the larger, a deflected stick
+ * wins. The packet number moves when the overlay changes. 1 if shown. */
+static int overlay_merge(XBOX_INPUT_STATE *pState)
+{
+    XBOX_GAMEPAD o;
+    DWORD packet;
+    int on, i;
+
+    OVL_LOCK();
+    on = g_overlay_on;
+    o = g_overlay;
+    packet = g_overlay_packet;
+    OVL_UNLOCK();
+    if (!on)
+        return 0;
+    pState->Gamepad.wButtons |= o.wButtons;
+    for (i = 0; i < 8; i++)
+        if (o.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
+            pState->Gamepad.bAnalogButtons[i] = o.bAnalogButtons[i];
+    if (o.sThumbLX) pState->Gamepad.sThumbLX = o.sThumbLX;
+    if (o.sThumbLY) pState->Gamepad.sThumbLY = o.sThumbLY;
+    if (o.sThumbRX) pState->Gamepad.sThumbRX = o.sThumbRX;
+    if (o.sThumbRY) pState->Gamepad.sThumbRY = o.sThumbRY;
+    pState->dwPacketNumber += packet;
+    return 1;
+}
+#endif
+
 /* ======================================================================== */
 #if defined(_WIN32)
 /* ====================  XInput backend  ================================== */
@@ -299,8 +371,16 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     SDL_LockJoysticks();
     SDL_GameController *c = controller_for_port_locked(dwPort);
     if (!c) {
+        int kb;
         SDL_UnlockJoysticks();
-        if (dwPort == 0 && xbox_InputKeyboardPoll(pState))
+        if (dwPort != 0)
+            return ERROR_DEVICE_NOT_CONNECTED;
+        /* [android-port] Port 0 without a pad: the keyboard and/or the
+         * on-screen pad stand in for it. */
+        kb = xbox_InputKeyboardPoll(pState);
+        if (!kb)
+            memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+        if (overlay_merge(pState) || kb)
             return ERROR_SUCCESS;
         return ERROR_DEVICE_NOT_CONNECTED;
     }
@@ -348,8 +428,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
     SDL_UnlockJoysticks();
 
-    if (dwPort == 0)
+    if (dwPort == 0) {
         keyboard_merge(pState);
+        overlay_merge(pState);              /* [android-port] */
+    }
     return ERROR_SUCCESS;
 }
 
@@ -384,6 +466,8 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
     SDL_LockJoysticks();
     connected = controller_for_port_locked(dwPort) != NULL;
     SDL_UnlockJoysticks();
+    if (!connected && dwPort == 0 && xbox_InputOverlayActive())
+        connected = TRUE;                   /* [android-port] the on-screen pad */
     return connected;
 }
 
@@ -395,7 +479,8 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 
     update_controllers();
     SDL_LockJoysticks();
-    if (!controller_for_port_locked(dwPort)) {
+    if (!controller_for_port_locked(dwPort)
+        && !(dwPort == 0 && xbox_InputOverlayActive())) {   /* [android-port] */
         SDL_UnlockJoysticks();
         return ERROR_DEVICE_NOT_CONNECTED;
     }
