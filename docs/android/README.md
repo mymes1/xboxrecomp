@@ -120,6 +120,14 @@ the secrets. `iso_url` may point to any of the three kinds of input above,
 including a zip of the disc's files. The URL need not end in `.zip`: a zip is
 recognised by its content.
 
+Size limit: the game's files are packaged inside the APK, and an APK must
+stay under 4 GiB because apksigner cannot sign ZIP64 archives. A game with
+more than 3.75 GiB of files (the extracted files, not the image, which
+includes padding) therefore cannot be built into an APK yet. Intake warns
+right after extraction (`fits_in_apk` in `reports/intake.json`), the apk
+stage refuses, and the stages before it still run and report. Shipping large
+games next to the APK is not implemented.
+
 ## Install and build
 
 Needs Linux x86-64, Python 3.10 or newer and git. Everything else is pinned

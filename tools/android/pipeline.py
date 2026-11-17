@@ -153,6 +153,14 @@ def stage_intake(ctx):
     manifest["image"] = {k: info[k] for k in ("sha256", "sha1", "size", "source", "verified",
                                               "verified_with", "matched", "container", "kind")}
     manifest["detect"] = det
+    # The game files ride inside the APK (apk.stage_assets refuses more than
+    # this). Said now, not after the recompile and NDK build; those stages
+    # still run, since their reports are worth having for any game.
+    fits = manifest["total_bytes"] <= apk.APK_GAME_BYTES_MAX
+    if not fits:
+        ctx.log("WARNING: the game files are %.2f GiB; the apk stage will refuse them (they are"
+                " packaged inside the APK, which must stay under 4 GiB). The stages before it"
+                " still run." % (manifest["total_bytes"] / 1024.0 ** 3))
     if getattr(a, "drop_image", False):
         # A full-disc dump is several GB and nothing after intake reads it:
         # its digests are recorded here. Only the work directory's entry
@@ -167,7 +175,8 @@ def stage_intake(ctx):
     iso.write_json(ctx.path("game_manifest.json"), manifest)
     iso.write_json(os.path.join(ctx.reports, "intake.json"), {
         "image": manifest["image"], "detect": det, "file_count": manifest["file_count"],
-        "total_bytes": manifest["total_bytes"], "default_xbe": manifest["default_xbe"]})
+        "total_bytes": manifest["total_bytes"], "default_xbe": manifest["default_xbe"],
+        "fits_in_apk": fits})
     return {"default_xbe": manifest["default_xbe"], "files": manifest["file_count"],
             "bytes": manifest["total_bytes"], "image_sha256": info["sha256"],
             "image_sha1": info["sha1"], "verified": info["verified"],

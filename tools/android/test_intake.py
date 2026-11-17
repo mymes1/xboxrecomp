@@ -644,6 +644,17 @@ class PipelineIntakeFlags(unittest.TestCase):
         with self.assertRaises(apk.ApkError) as cm:
             apk.stage_assets(work, os.path.join(self.tmp.name, "app"), log=lambda *a: None)
         self.assertIn("under 4 GiB", str(cm.exception))
+        self.assertTrue(self._json(work, "reports", "intake.json")["fits_in_apk"])
+
+    def test_intake_warns_when_the_game_cannot_fit_an_apk(self):
+        from unittest import mock
+        from tools.android import apk
+        work = os.path.join(self.tmp.name, "w")
+        with mock.patch.object(apk, "APK_GAME_BYTES_MAX", 1000):
+            self.assertEqual(self._run(work, "--sha1", _sha1(self.img)), 0)   # still passes
+        self.assertFalse(self._json(work, "reports", "intake.json")["fits_in_apk"])
+        with open(os.path.join(work, "reports", "logs", "intake.log"), encoding="utf-8") as f:
+            self.assertIn("the apk stage will refuse them", f.read())
 
     def test_zip_of_files_through_the_pipeline(self):
         z = _zip_files(os.path.join(self.tmp.name, "Game.zip"), FILES, prefix="Game/")
