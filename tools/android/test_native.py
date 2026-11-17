@@ -195,6 +195,29 @@ class BootLogTest(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class AppTemplateXmlTest(unittest.TestCase):
+    """aapt2 and the manifest merger reject malformed XML only in the Gradle
+    build (CI); parse every XML file of the app template here first. A "--"
+    inside a comment, for one, is not well-formed."""
+
+    def test_template_xml_is_well_formed(self):
+        import xml.etree.ElementTree as ET
+        tpl = os.path.join(ROOT, "templates", "xbr-game", "app")
+        seen = 0
+        for root, _dirs, files in os.walk(tpl):
+            for n in files:
+                if n.endswith(".xml"):
+                    path = os.path.join(root, n)
+                    with open(path, encoding="utf-8") as f:
+                        text = f.read()
+                    try:
+                        ET.fromstring(text.replace("@@", "x"))
+                    except ET.ParseError as e:
+                        self.fail("%s: %s" % (os.path.relpath(path, ROOT), e))
+                    seen += 1
+        self.assertGreaterEqual(seen, 3)     # manifest, strings, styles
+
+
 @unittest.skipUnless(_zig(), "ziglang (requirements-dev.txt) not installed")
 class ElfInfoTest(unittest.TestCase):
     def test_aarch64_shared_object(self):
