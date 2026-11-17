@@ -77,6 +77,9 @@ def summarize(work, name, extra=None):
         keep["fatal_lines"] = rt.get("fatal_lines", [])[:20]
         keep["title_lines"] = rt.get("title_lines", [])[:30]
         keep["status"] = rt.get("status", [])[-4:]
+        for k in ("game_zip", "files_import", "files_install"):
+            if k in rt:
+                keep[k] = rt[k]
         out.append("## runtime_test.json (excerpt)")
         out.append("```json\n%s\n```" % json.dumps(keep, indent=1)[:12000])
         if rt.get("crash_buffer"):
@@ -85,7 +88,7 @@ def summarize(work, name, extra=None):
         # Layout and kernel warnings are printed long before the tail; a
         # window that failed to map is the cause of a crash many lines later.
         key = [l for l in _tail(os.path.join(rep, "logs", "device_runtime.log"), 100000)
-               if re.search(r"WARNING|ERROR|FAILED|\[CRASH\]|XBRTEST|guest window|"
+               if re.search(r"WARNING|ERROR|FAILED|\[CRASH\]|\[FILES\]|XBRTEST|guest window|"
                             r"Contiguous window|aperture:|RAM mirror", l)
                and "Unresolved kernel ordinal" not in l]
         if key:

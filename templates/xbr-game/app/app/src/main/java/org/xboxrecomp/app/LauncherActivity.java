@@ -351,8 +351,12 @@ public class LauncherActivity extends Activity {
             return;
         }
         if (GameFiles.bundled(this)) {
+            final long t0 = System.currentTimeMillis();
             runJob(getString(R.string.installing), getString(R.string.install_failed), p -> {
                 GameFiles.install(this, p);
+                Log.i(TAG, String.format(java.util.Locale.ROOT,
+                        "[FILES] installed the game files (%s) from the APK in %.1fs",
+                        GameFiles.describe(this), (System.currentTimeMillis() - t0) / 1000.0));
                 return null;
             });
             return;

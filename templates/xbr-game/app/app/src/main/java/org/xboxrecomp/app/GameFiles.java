@@ -41,9 +41,11 @@ import java.util.zip.ZipInputStream;
  *  - external (a game too large for an APK): the user supplies the zip of
  *    the game's files -- default.xbe at its root, or in its one folder -- and
  *    importZip() takes from it exactly the files of the list, each checked
- *    against its size and SHA-256. Anything else in the zip is ignored; a
- *    file that differs (another version or region of the game) stops the
- *    import, because the recompiled code only fits the files it came from.
+ *    against its size and SHA-256. Anything else in the zip is ignored. The
+ *    import succeeds only when every listed file arrived intact; otherwise
+ *    it names the first file that differs (another version or region of the
+ *    game: the recompiled code only fits the files it came from) or is
+ *    missing.
  */
 final class GameFiles {
     interface Progress {
@@ -55,7 +57,7 @@ final class GameFiles {
         int files;
         long bytes;
         int ignored;
-        String folder;
+        String folder;          // where default.xbe was: "" (root) or "Name/"
     }
 
     private GameFiles() {}
@@ -244,24 +246,16 @@ final class GameFiles {
     }
 
     /**
-     * The manifest key (lower-case path) an entry stands for, and the folder
-     * it is in: { key, "" } at the zip's root, { key, "Name/" } in one folder.
-     * folder: the one already seen (null until the first match).
+     * The manifest keys (lower-case paths) a zip entry can stand for: the
+     * entry itself (default.xbe at the zip's root), then the entry without
+     * its first folder (default.xbe in the zip's one folder). Each file is
+     * checked against its SHA-256 anyway, so a wrong guess cannot install a
+     * wrong file.
      */
-    private static String[] match(Map<String, JSONObject> want, String name, String folder) {
+    private static String[] candidates(String name) {
         String low = name.toLowerCase(Locale.ROOT);
-        if ((folder == null || folder.isEmpty()) && want.containsKey(low)) {
-            return new String[] { low, "" };
-        }
-        int slash = name.indexOf('/');
-        if (slash > 0 && (folder == null || !folder.isEmpty())) {
-            String pre = name.substring(0, slash + 1);
-            String rest = low.substring(slash + 1);
-            if ((folder == null || folder.equals(pre)) && want.containsKey(rest)) {
-                return new String[] { rest, pre };
-            }
-        }
-        return null;
+        int slash = low.indexOf('/');
+        return slash > 0 ? new String[] { low, low.substring(slash + 1) } : new String[] { low };
     }
 
     private static String hex(byte[] d) {
@@ -299,6 +293,7 @@ final class GameFiles {
         }
         Set<String> done = new HashSet<>();
         Imported r = new Imported();
+        String firstDifference = null;
         MessageDigest sha = MessageDigest.getInstance("SHA-256");
         byte[] buf = new byte[1 << 20];
         try (ZipInputStream zin = new ZipInputStream(new BufferedInputStream(raw, 1 << 16),
@@ -309,19 +304,19 @@ final class GameFiles {
                 if (e.isDirectory() || name.isEmpty() || name.endsWith("/") || junk(name)) {
                     continue;
                 }
-                String[] hit = match(want, name, r.folder);
-                if (hit == null) {
+                JSONObject f = null;
+                for (String key : candidates(name)) {
+                    JSONObject cand = want.get(key);
+                    if (cand != null && !done.contains(cand.getString("path"))) {
+                        f = cand;
+                        break;
+                    }
+                }
+                if (f == null) {
                     r.ignored++;
                     continue;
                 }
-                if (r.folder == null) {
-                    r.folder = hit[1];
-                }
-                JSONObject f = want.get(hit[0]);
                 String rel = f.getString("path");
-                if (!done.add(rel)) {
-                    throw new IOException("the zip holds " + rel + " twice");
-                }
                 long size = f.getLong("size");
                 File out = target(root, rel);
                 File tmp = new File(out.getPath() + ".part");
@@ -336,9 +331,8 @@ final class GameFiles {
                         }
                         sha.update(buf, 0, k);
                         os.write(buf, 0, k);
-                        r.bytes += k;
                         if (p != null) {
-                            p.update(r.bytes, total, rel);
+                            p.update(r.bytes + n, total, rel);
                         }
                     }
                 }
@@ -347,17 +341,27 @@ final class GameFiles {
                 if (got == null || !got.equals(expected)) {
                     //noinspection ResultOfMethodCallIgnored
                     tmp.delete();
-                    String why = got == null
-                            ? String.format(Locale.ROOT, "%s bytes in the zip, the game's has %d",
-                                            n > size ? "more" : String.valueOf(n), size)
-                            : "SHA-256 " + got.substring(0, 16) + "..., expected "
-                              + expected.substring(0, 16) + "...";
-                    throw new IOException(rel + " in the zip is not the file this app was built from ("
-                            + why + ")" + (rel.equalsIgnoreCase(xbe)
-                            ? ": a different version or region of the game?" : ""));
+                    r.ignored++;
+                    if (firstDifference == null) {
+                        String why = got == null
+                                ? String.format(Locale.ROOT, "%s bytes in the zip, %d expected",
+                                                n > size ? "more" : String.valueOf(n), size)
+                                : "SHA-256 " + got.substring(0, 16) + "..., expected "
+                                  + expected.substring(0, 16) + "...";
+                        firstDifference = name + " is not the file this app was built from ("
+                                + why + ")" + (rel.equalsIgnoreCase(xbe)
+                                ? ": a different version or region of the game?" : "");
+                    }
+                    continue;
                 }
                 replace(tmp, out);
+                done.add(rel);
                 r.files++;
+                r.bytes += size;
+                if (rel.equalsIgnoreCase(xbe)) {
+                    int cut = name.length() - rel.length();
+                    r.folder = cut > 0 ? name.substring(0, cut) : "";
+                }
             }
         } catch (ZipException ze) {
             throw new IOException("cannot read the zip (" + ze.getMessage() + "). Make the zip with"
@@ -371,10 +375,14 @@ final class GameFiles {
                     first = path;
                 }
             }
-            throw new IOException(String.format(Locale.ROOT,
-                    "the zip lacks %d of the game's %d files (first: %s). It must hold the files"
-                    + " this app was built from, with %s at its root or in its one folder.",
-                    list.length() - done.size(), list.length(), first, xbe));
+            String msg = String.format(Locale.ROOT,
+                    "%d of the game's %d files were not found intact in the zip (first: %s).",
+                    list.length() - done.size(), list.length(), first);
+            if (firstDifference != null) {
+                msg += " " + firstDifference + ".";
+            }
+            throw new IOException(msg + " The zip must hold the files this app was built from,"
+                    + " with " + xbe + " at its root or in its one folder.");
         }
         markInstalled(root, m);
         return r;

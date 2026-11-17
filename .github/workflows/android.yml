@@ -155,6 +155,8 @@ jobs:
           cp -a build/games/xbrtest/project build/games/xbrtest/game build/games/xbrtest/reports \
             build/games/xbrtest/game_manifest.json $W/
           cp -a build/games/xbrtest/out/lib $W/out/
+          # Same signing key (an update of the same package), fresh Gradle state.
+          rm -rf $W/project/app/.gradle $W/project/app/build $W/project/app/app/build
           python3 -m tools.android.pipeline run --work $W --from apk --to verify --game-files external
           cp build/zipcheck/xbrtest-files.zip $W/
           ls -l build/games/xbrtest/out/*.apk $W/out/*.apk
