@@ -5,6 +5,8 @@ name: Android pipeline
 # image YOU provide when started by hand (workflow_dispatch: iso_url with
 # iso_sha256 and/or iso_sha1, or the XBR_ISO_URL secret with XBR_ISO_SHA256
 # and/or XBR_ISO_SHA1). SHA-1 is what disc databases such as Redump list.
+# Instead of an image, the URL may point to a .zip of the disc's files (what
+# extract-xiso leaves), with default.xbe at the zip's root.
 #
 # Each job publishes its result as a check run (tools/android/ci_report.py)
 # and uploads the work directory's reports and native libraries.
@@ -30,15 +32,15 @@ on:
   workflow_dispatch:
     inputs:
       iso_url:
-        description: "URL of your own disc image (an authorized copy). Leave empty to use the XBR_ISO_URL secret, or to run the test title only."
+        description: "URL of your own disc image (an authorized copy), of a .zip holding it, or of a .zip of the disc's files with default.xbe at its root (extract-xiso's output). Leave empty to use the XBR_ISO_URL secret, or to run the test title only."
         required: false
         default: ""
       iso_sha256:
-        description: "SHA-256 of that image, or of the .zip it is in. With iso_url, give this, iso_sha1, or both."
+        description: "SHA-256 of that image, or of the .zip (for a zip of the disc's files: of the zip). With iso_url, give this, iso_sha1, or both."
         required: false
         default: ""
       iso_sha1:
-        description: "SHA-1 of that image or its .zip (as Redump lists it). When both digests are given, both must match."
+        description: "SHA-1 of that image or of the .zip (Redump lists the image's). When both digests are given, both must match."
         required: false
         default: ""
       upload_apk:
@@ -121,6 +123,25 @@ jobs:
           python3 -m tools.android.pipeline run --source build/testtitle/xbrtest.iso \
             --sha256 "$TESTTITLE_SHA256" --work build/games/xbrtest --to verify \
             --native-mode ndk --ndk "$XBOXRECOMP_NDK" --host-seconds 20
+
+      # The other kind of input: the disc's files as extract-xiso (the pinned
+      # source) leaves them, zipped with default.xbe at the zip's root. The
+      # same game must come out of it as out of the image.
+      - name: "Intake from a zip of extract-xiso's output gives the same game"
+        run: |
+          cmake -S build/android-deps/src/extract-xiso -B build/extract-xiso -DCMAKE_BUILD_TYPE=Release > /dev/null
+          cmake --build build/extract-xiso > /dev/null
+          rm -rf build/zipcheck && mkdir -p build/zipcheck
+          (cd build/zipcheck && ../extract-xiso/extract-xiso -x ../testtitle/xbrtest.iso)
+          (cd build/zipcheck/xbrtest && python3 -m zipfile -c ../xbrtest-files.zip .)
+          python3 -m zipfile -l build/zipcheck/xbrtest-files.zip
+          sha1=$(sha1sum build/zipcheck/xbrtest-files.zip | cut -d' ' -f1)
+          python3 -m tools.android.pipeline run --source build/zipcheck/xbrtest-files.zip \
+            --sha1 "$sha1" --work build/games/xbrtest-zip --to project
+          diff -r build/games/xbrtest/game build/games/xbrtest-zip/game
+          diff -r build/games/xbrtest/project/native/gen build/games/xbrtest-zip/project/native/gen
+          diff build/games/xbrtest/project/xbr_game.json build/games/xbrtest-zip/project/xbr_game.json
+          echo "zip of the files: same game files, generated code and configuration as the image"
 
       - name: Report
         if: always()

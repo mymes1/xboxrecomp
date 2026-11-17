@@ -60,8 +60,38 @@ python3 -m tools.android.pipeline status --work build/games/mygame
 ```
 
 `--source` is a path, a `file://` URL or an `http(s)://` URL (credentials in
-the URL are sent as a header and never logged), to an `.iso`/`.xiso` image or
-a `.zip` holding exactly one.
+the URL are sent as a header and never logged), to one of:
+
+- an `.iso`/`.xiso` disc image;
+- a `.zip` holding exactly one such image;
+- a `.zip` of the disc's files, the way extract-xiso (or any XISO extractor)
+  leaves them, with `default.xbe` at the zip's root. That is what you get by
+  zipping the *contents* of the extracted folder:
+
+  ```
+  extract-xiso -x game.iso                 # makes game/ with default.xbe in it
+  cd game && zip -r ../game-files.zip .    # default.xbe at the zip's root
+  python3 -m tools.android.pipeline run --work build/games/mygame \
+      --source ../game-files.zip --sha1 "$(sha1sum ../game-files.zip | cut -c1-40)"
+  ```
+
+  A zip of the folder itself (`game/default.xbe`, one folder at the root) is
+  also accepted. Archiver leftovers (`__MACOSX/`, `._*`, `.DS_Store`,
+  `Thumbs.db`, `desktop.ini`) are ignored, and `\` separators written by some
+  Windows archivers are read as `/`. Every entry is checked before anything is
+  written: no absolute paths, no `..`, no names that differ only in letter
+  case, no symbolic links or encrypted entries. Each file's size and CRC are
+  checked, and free disk space is checked first. The game files and the
+  manifest are the same as from the image of the same disc, so every later
+  stage works unchanged. CI checks this on the test title: it unpacks the
+  image with the pinned extract-xiso, zips the result, and compares the
+  extracted files, the generated C and `xbr_game.json` with those from the
+  image.
+
+  The zip only needs to be readable by Python's `zipfile`, which means Store
+  or Deflate (most archivers' default), plus bzip2 and LZMA. Deflate64
+  (compression method 9, which some Windows tools produce for large files)
+  cannot be read, and intake says so.
 
 The image is verified at intake against the digests you give:
 
@@ -72,8 +102,12 @@ The image is verified at intake against the digests you give:
 - A digest may be plain hex or labelled (`sha1:…`, `SHA-1:…`); letter case
   does not matter. A 40-digit value passed as `--sha256`, or a 64-digit value
   passed as `--sha1`, is refused with a hint to use the other option.
-- For a `.zip`, the digests may be those of the zip or of the image inside
-  it (databases list the image).
+- For a `.zip` holding an image, the digests may be those of the zip or of
+  the image inside it (databases list the image). A zip of the disc's files
+  has no image, so its digests are the zip's own. Disc databases list the
+  image's digest, so for a zip you made yourself, take the zip's digest when
+  you make it (as above) and keep the image's digest as the record of what
+  you dumped.
 - Without any digest the run continues, but the image is reported as
   **unverified**. Both of its digests are still recorded in
   `reports/intake.json` and in the compatibility report.
@@ -82,7 +116,9 @@ In GitHub Actions, start *Android pipeline* by hand with `iso_url` plus
 `iso_sha256` and/or `iso_sha1`, or set the `XBR_ISO_URL` repository secret
 with `XBR_ISO_SHA256` and/or `XBR_ISO_SHA1`. The inputs and the secrets are
 each used as a complete set: with `iso_url` given, no digest is taken from
-the secrets.
+the secrets. `iso_url` may point to any of the three kinds of input above,
+including a zip of the disc's files. The URL need not end in `.zip`: a zip is
+recognised by its content.
 
 ## Install and build
 

@@ -132,14 +132,16 @@ def _host_summary(r):
 def _image_line(img):
     if not img:
         return "Disc image: no intake record."
-    line = "Disc image SHA-256 `%s`, SHA-1 %s: " % (
+    files = img.get("kind") == "files"
+    line = "%s SHA-256 `%s`, SHA-1 %s: " % (
+        "Game files (a zip of the disc's files)" if files else "Disc image",
         img.get("sha256"), "`%s`" % img["sha1"] if img.get("sha1") else "not recorded")
     if not img.get("verified"):
         return line + "**unverified** (no expected digest was given)."
     names = {"sha256": "SHA-256", "sha1": "SHA-1"}
     return line + "verified against the supplied %s of the %s." % (
         " and ".join(names.get(a, a) for a in img.get("verified_with") or []),
-        "zip it came in" if img.get("matched") == "container" else "image")
+        "zip" if files else "zip it came in" if img.get("matched") == "container" else "image")
 
 
 def to_markdown(r):

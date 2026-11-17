@@ -345,6 +345,244 @@ class Intake(unittest.TestCase):
         self.assertIn("other.xbe", str(cm.exception))
 
 
+def _zip_files(path, files, prefix="", extra=(), backslashes=False):
+    """A zip of `files` under `prefix` (plus raw (name, data) entries)."""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for rel, data in files.items():
+            name = prefix + rel
+            if backslashes:
+                name = name.replace("/", "\\")
+            zf.writestr(name, data)
+        for name, data in extra:
+            zf.writestr(name, data)
+    return path
+
+
+class FilesZip(unittest.TestCase):
+    """A zip of the disc's files instead of an image."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.logs = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def log(self, m):
+        self.logs.append(m)
+
+    def _intake(self, z, sha256=None, sha1=None):
+        out = os.path.join(self.dir, "w-" + os.path.basename(z))
+        info = iso.acquire(z, os.path.join(out, "input"), sha256, log=self.log,
+                           expected_sha1=sha1)
+        det = iso.detect_files(info["path"])
+        man = iso.extract_files(info["path"], os.path.join(out, "game"), prefix=det["prefix"],
+                                log=self.log)
+        return info, det, man, os.path.join(out, "game")
+
+    def _same_files(self, man, game):
+        want = {k: hashlib.sha256(v).hexdigest() for k, v in FILES.items()}
+        self.assertEqual({f["path"]: f["sha256"] for f in man["files"]}, want)
+        self.assertEqual(man["total_bytes"], sum(len(v) for v in FILES.values()))
+        for rel, data in FILES.items():
+            with open(os.path.join(game, *rel.split("/")), "rb") as f:
+                self.assertEqual(f.read(), data)
+        self.assertEqual(os.path.basename(iso.find_default_xbe(game)), "default.xbe")
+
+    def test_files_at_the_root(self):
+        z = _zip_files(os.path.join(self.dir, "game.zip"), FILES)
+        info, det, man, game = self._intake(z, sha1=_sha1(z))
+        self.assertEqual(info["kind"], "files")
+        self.assertEqual(info["matched"], "container")
+        self.assertEqual((info["sha256"], info["sha1"]), (_sha(z), _sha1(z)))
+        self.assertEqual(det["prefix"], "")
+        self.assertIn("at its root", det["layout"])
+        self._same_files(man, game)
+
+    def test_files_in_one_folder_with_archiver_leftovers(self):
+        # What zipping a folder on a Mac gives: the folder, __MACOSX and ._ files.
+        z = _zip_files(os.path.join(self.dir, "Game (USA).zip"), FILES, prefix="Game (USA)/",
+                       extra=[("__MACOSX/Game (USA)/._default.xbe", b"x"),
+                              ("Game (USA)/.DS_Store", b"x"), ("Game (USA)/data/._level1.bin", b"x")])
+        info, det, man, game = self._intake(z)
+        self.assertEqual(det["prefix"], "Game (USA)/")
+        self.assertEqual(det["archiver_entries_ignored"], 3)
+        self.assertFalse(info["verified"])
+        self._same_files(man, game)
+        self.assertFalse(os.path.exists(os.path.join(game, ".DS_Store")))
+
+    def test_windows_backslash_names(self):
+        z = _zip_files(os.path.join(self.dir, "win.zip"), FILES, backslashes=True)
+        info, det, man, game = self._intake(z)
+        self._same_files(man, game)
+
+    def test_same_manifest_as_the_image(self):
+        src = os.path.join(self.dir, "src")
+        _tree(src, FILES)
+        img = os.path.join(self.dir, "game.iso")
+        xiso_build.build(src, img)
+        from_image = iso.extract(img, os.path.join(self.dir, "img-game"), log=self.log)
+        z = _zip_files(os.path.join(self.dir, "game.zip"), FILES)
+        _info, _det, from_zip, _game = self._intake(z)
+        self.assertEqual(from_zip, from_image)
+
+    def test_a_zip_with_one_image_is_still_an_image(self):
+        src = os.path.join(self.dir, "src")
+        _tree(src, FILES)
+        img = os.path.join(self.dir, "game.iso")
+        xiso_build.build(src, img)
+        z = os.path.join(self.dir, "img.zip")
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.write(img, "game.iso")
+        info = iso.acquire(z, os.path.join(self.dir, "in"), expected_sha1=_sha1(img), log=self.log)
+        self.assertEqual(info["kind"], "image")
+        self.assertEqual(info["matched"], "image")
+
+    def test_digest_mismatch_places_nothing(self):
+        z = _zip_files(os.path.join(self.dir, "game.zip"), FILES)
+        out = os.path.join(self.dir, "in")
+        with self.assertRaises(iso.IsoError) as cm:
+            iso.acquire(z, out, expected_sha1="4" * 40, log=self.log)
+        self.assertIn("a zip of the game's files", str(cm.exception))
+        self.assertIn("got " + _sha1(z), str(cm.exception))
+        self.assertFalse(os.path.lexists(os.path.join(out, "game.zip")))
+
+    def test_neither_files_nor_an_image(self):
+        z = _zip_files(os.path.join(self.dir, "odd.zip"), {"readme.txt": b"x", "a/b.bin": b"y"})
+        with self.assertRaises(iso.IsoError) as cm:
+            iso.acquire(z, os.path.join(self.dir, "in"), log=self.log)
+        msg = str(cm.exception)
+        self.assertIn("default.xbe", msg)
+        self.assertIn("readme.txt", msg)
+        # Two folders at the root, default.xbe a level down: not taken as files.
+        z = _zip_files(os.path.join(self.dir, "two.zip"), {"A/default.xbe": b"x", "B/x": b"y"})
+        with self.assertRaises(iso.IsoError):
+            iso.acquire(z, os.path.join(self.dir, "in2"), log=self.log)
+
+    def test_unsafe_entries_are_refused_before_writing(self):
+        bad = [("../escape.bin", b"x"), ("/abs.bin", b"x"), ("data/../../up.bin", b"x"),
+               ("C:/win.bin", b"x"), ("data//double.bin", b"x")]
+        for name, data in bad:
+            z = _zip_files(os.path.join(self.dir, "bad.zip"), FILES, extra=[(name, data)])
+            game = os.path.join(self.dir, "g")
+            with self.assertRaises(iso.IsoError, msg=name):
+                iso.extract_files(z, game, log=self.log)
+            self.assertFalse(os.path.exists(os.path.join(self.dir, "escape.bin")))
+            self.assertFalse(os.path.exists(os.path.join(game, "default.xbe")), name)
+
+    def test_case_twins_and_duplicates_are_refused(self):
+        z = _zip_files(os.path.join(self.dir, "case.zip"), FILES, extra=[("DATA/LEVEL1.BIN", b"z")])
+        with self.assertRaises(iso.IsoError) as cm:
+            iso.extract_files(z, os.path.join(self.dir, "g1"), log=self.log)
+        self.assertIn("letter case", str(cm.exception))
+        z = os.path.join(self.dir, "dup.zip")
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr("default.xbe", b"a")
+            zf.writestr("default.xbe", b"b")
+        with self.assertRaises(iso.IsoError):
+            iso.extract_files(z, os.path.join(self.dir, "g2"), log=self.log)
+
+    def test_symlink_entry_is_refused(self):
+        z = os.path.join(self.dir, "link.zip")
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr("default.xbe", b"x")
+            li = zipfile.ZipInfo("data/link")
+            li.external_attr = (0o120777 << 16)
+            zf.writestr(li, "/etc/passwd")
+        with self.assertRaises(iso.IsoError) as cm:
+            iso.extract_files(z, os.path.join(self.dir, "g"), log=self.log)
+        self.assertIn("symbolic link", str(cm.exception))
+
+    def test_corrupt_entry_is_caught(self):
+        z = _zip_files(os.path.join(self.dir, "crc.zip"), {"default.xbe": b"A" * 5000})
+        raw = bytearray(open(z, "rb").read())
+        hdr = raw.index(b"PK\x03\x04")
+        name_len, extra_len = struct.unpack_from("<HH", raw, hdr + 26)
+        data_at = hdr + 30 + name_len + extra_len
+        raw[data_at + 2] ^= 0xFF                 # damage the compressed data
+        open(z, "wb").write(bytes(raw))
+        with self.assertRaises(iso.IsoError) as cm:
+            iso.extract_files(z, os.path.join(self.dir, "g"), log=self.log)
+        self.assertIn("damaged", str(cm.exception))
+
+    def test_deflate64_is_refused_with_a_hint(self):
+        def method9(path):
+            # Rewrite every entry's compression method to 9 (Deflate64) in
+            # the local headers and the central directory.
+            raw = bytearray(open(path, "rb").read())
+            for sig, off in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
+                i = raw.find(sig)
+                while i >= 0:
+                    struct.pack_into("<H", raw, i + off, 9)
+                    i = raw.find(sig, i + 4)
+            open(path, "wb").write(bytes(raw))
+            return path
+        z = os.path.join(self.dir, "d64.zip")
+        with zipfile.ZipFile(z, "w", zipfile.ZIP_STORED) as zf:
+            for rel, data in FILES.items():
+                zf.writestr(rel, data)
+        method9(z)
+        with self.assertRaises(iso.IsoError) as cm:
+            iso.extract_files(z, os.path.join(self.dir, "g"), log=self.log)
+        self.assertIn("Deflate", str(cm.exception))
+        # The same for a zip holding an image.
+        zi = os.path.join(self.dir, "d64img.zip")
+        with zipfile.ZipFile(zi, "w", zipfile.ZIP_STORED) as zf:
+            zf.writestr("game.iso", b"\0" * 4096)
+        method9(zi)
+        with self.assertRaises(iso.IsoError) as cm:
+            iso.acquire(zi, os.path.join(self.dir, "in"), log=self.log)
+        self.assertIn("Deflate", str(cm.exception))
+
+    def test_not_enough_disk_space(self):
+        from unittest import mock
+        z = _zip_files(os.path.join(self.dir, "game.zip"), FILES)
+        tiny = shutil_usage(total=1 << 30, used=(1 << 30) - 1024, free=1024)
+        with mock.patch("tools.android.iso.shutil.disk_usage", return_value=tiny):
+            with self.assertRaises(iso.IsoError) as cm:
+                iso.extract_files(z, os.path.join(self.dir, "g"), log=self.log)
+        self.assertIn("not enough disk space", str(cm.exception))
+
+    def test_url_download_of_a_files_zip(self):
+        serve = os.path.join(self.dir, "srv")
+        os.makedirs(serve)
+        z = _zip_files(os.path.join(serve, "download"), FILES, prefix="My Game/")
+        with _Server(serve) as srv:
+            url = srv.base + "/download?token=secret"        # no .zip in the URL
+            out = os.path.join(self.dir, "dl")
+            info = iso.acquire(url, out, expected_sha1=_sha1(z), log=self.log)
+            self.assertEqual((info["kind"], info["zip_prefix"]), ("files", "My Game/"))
+            self.assertEqual(_sha(info["path"]), _sha(z))
+            self.assertNotIn("secret", info["source"])
+            self.assertEqual(sorted(os.listdir(out)), ["game.zip"])   # no .part left
+            bad = os.path.join(self.dir, "dl2")
+            with self.assertRaises(iso.IsoError):
+                iso.acquire(url, bad, expected_sha1="5" * 40, log=self.log)
+            self.assertEqual(os.listdir(bad), [])
+
+    def test_rerun_on_the_placed_zip_and_switching_kinds(self):
+        z = _zip_files(os.path.join(self.dir, "game.zip"), FILES)
+        out = os.path.join(self.dir, "in")
+        iso.acquire(z, out, log=self.log, link_local=False)
+        placed = os.path.join(out, "game.zip")
+        info = iso.acquire(placed, out, expected_sha1=_sha1(z), log=self.log)
+        self.assertEqual((info["kind"], info["path"]), ("files", placed))
+        # Then an image: the zip a previous run left goes.
+        src = os.path.join(self.dir, "src")
+        _tree(src, FILES)
+        img = os.path.join(self.dir, "game.iso")
+        xiso_build.build(src, img)
+        iso.acquire(img, out, log=self.log)
+        self.assertFalse(os.path.lexists(placed))
+        self.assertTrue(os.path.lexists(os.path.join(out, "disc.iso")))
+
+
+def shutil_usage(total, used, free):
+    import collections
+    return collections.namedtuple("usage", "total used free")(total, used, free)
+
+
 class PipelineIntakeFlags(unittest.TestCase):
     """--sha1 / --sha256 through the pipeline's intake stage (no zig needed)."""
 
@@ -406,6 +644,27 @@ class PipelineIntakeFlags(unittest.TestCase):
         with self.assertRaises(apk.ApkError) as cm:
             apk.stage_assets(work, os.path.join(self.tmp.name, "app"), log=lambda *a: None)
         self.assertIn("under 4 GiB", str(cm.exception))
+
+    def test_zip_of_files_through_the_pipeline(self):
+        z = _zip_files(os.path.join(self.tmp.name, "Game.zip"), FILES, prefix="Game/")
+        work = os.path.join(self.tmp.name, "wz")
+        from tools.android import pipeline, compat
+        rc = pipeline.main(["run", "--work", work, "--source", z, "--only", "intake",
+                            "--sha1", _sha1(z), "--drop-image"])
+        self.assertEqual(rc, 0)
+        man = self._json(work, "game_manifest.json")
+        self.assertEqual(man["default_xbe"], "default.xbe")
+        self.assertEqual(man["image"]["kind"], "files")
+        self.assertEqual(man["detect"]["prefix"], "Game/")
+        self.assertTrue(man["image"]["dropped_after_extraction"])
+        self.assertTrue(os.path.exists(z))                 # the user's zip stays
+        # The same manifest as from the image of the same files.
+        work_i = os.path.join(self.tmp.name, "wi")
+        self.assertEqual(self._run(work_i, "--sha1", _sha1(self.img)), 0)
+        self.assertEqual(man["files"], self._json(work_i, "game_manifest.json")["files"])
+        md = compat.to_markdown(compat.build(work))
+        self.assertIn("Game files (a zip of the disc's files)", md)
+        self.assertIn("verified against the supplied SHA-1 of the zip.", md)
 
     def test_sha1_flag_mismatch_fails_the_stage(self):
         work = os.path.join(self.tmp.name, "w")

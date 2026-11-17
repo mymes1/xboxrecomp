@@ -2,6 +2,7 @@
 
     python3 -m tools.android.pipeline run --source game.iso --sha256 <hex> --work build/games/x
     python3 -m tools.android.pipeline run --source https://... --sha1 <hex> --work ...
+    python3 -m tools.android.pipeline run --source game-files.zip --sha1 <hex> --work ...
     python3 -m tools.android.pipeline run --work build/games/x --from recompile
     python3 -m tools.android.pipeline status --work build/games/x
 
@@ -11,7 +12,11 @@ says why):
 
   intake     acquire the user's image, verify it (--sha256 and/or --sha1: of
              the image, or of the .zip it comes in), detect XDVDFS, extract
-             every file into <work>/game with a manifest, locate default.xbe
+             every file into <work>/game with a manifest, locate default.xbe.
+             Instead of an image: a .zip of the disc's files (what
+             extract-xiso leaves), default.xbe at its root or in the one
+             folder there; verified by the zip's digests, extracted with the
+             same checks into the same manifest
   analyze    toolkit XBE parser + structured analysis (sections, imports,
              libraries, certificate, title image) -> reports/xbe_analysis.*
   recompile  the toolkit's disasm -> func_id -> abi_analysis -> recomp, into
@@ -29,7 +34,8 @@ says why):
 
 Work directory layout:
 
-  input/disc.iso         the image (a symlink for local files)
+  input/disc.iso         the image (a symlink for local files), or
+  input/game.zip         the zip of the disc's files
   game/                  extracted disc, as the runtime reads it
   analysis/              default.xbe + the toolkit's JSON outputs
   project/               generated Android project (native/ and app/)
@@ -125,30 +131,39 @@ def stage_intake(ctx):
             "zip" if info["matched"] == "container" else "image")
     else:
         how = "UNVERIFIED: no expected hash given"
-    ctx.log("image: %s, %d bytes, sha256 %s, sha1 %s (%s)" % (
+    ctx.log("%s: %s, %d bytes, sha256 %s, sha1 %s (%s)" % (
+        "zip of the game's files" if info["kind"] == "files" else "image",
         info["source"], info["size"], info["sha256"], info["sha1"], how))
-    det = iso.detect(info["path"])
-    ctx.log("format: %s at partition base 0x%X" % (det["layout"], det["partition_base"]))
     game = ctx.path("game")
     if os.path.exists(game):
         shutil.rmtree(game)
-    manifest = iso.extract(info["path"], game, log=ctx.log)
+    if info["kind"] == "files":
+        # The disc's files, zipped: extracted with the same checks, into the
+        # same manifest, as files from an image.
+        det = iso.detect_files(info["path"])
+        ctx.log("format: %s, %d files, %d bytes" % (det["layout"], det["file_count"],
+                                                    det["total_bytes"]))
+        manifest = iso.extract_files(info["path"], game, prefix=det["prefix"], log=ctx.log)
+    else:
+        det = iso.detect(info["path"])
+        ctx.log("format: %s at partition base 0x%X" % (det["layout"], det["partition_base"]))
+        manifest = iso.extract(info["path"], game, log=ctx.log)
     xbe = iso.find_default_xbe(game)
     manifest["default_xbe"] = os.path.relpath(xbe, game)
     manifest["image"] = {k: info[k] for k in ("sha256", "sha1", "size", "source", "verified",
-                                              "verified_with", "matched", "container")}
+                                              "verified_with", "matched", "container", "kind")}
     manifest["detect"] = det
     if getattr(a, "drop_image", False):
         # A full-disc dump is several GB and nothing after intake reads it:
         # its digests are recorded here. Only the work directory's entry
-        # goes (input/disc.iso: a download, a copy or a link -- never the
-        # user's own file).
+        # goes (input/disc.iso or input/game.zip: a download, a copy or a
+        # link -- never the user's own file).
         inside = os.path.abspath(info["path"]).startswith(os.path.abspath(ctx.path("input")) + os.sep)
         if inside and os.path.lexists(info["path"]):
             os.remove(info["path"])
             manifest["image"]["dropped_after_extraction"] = True
-            ctx.log("image removed after extraction (--drop-image); its digests are in"
-                    " reports/intake.json")
+            ctx.log("%s removed after extraction (--drop-image); its digests are in"
+                    " reports/intake.json" % ("zip" if info["kind"] == "files" else "image"))
     iso.write_json(ctx.path("game_manifest.json"), manifest)
     iso.write_json(os.path.join(ctx.reports, "intake.json"), {
         "image": manifest["image"], "detect": det, "file_count": manifest["file_count"],
@@ -382,7 +397,9 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="run stages")
     r.add_argument("--work", required=True, help="per-game work directory")
-    r.add_argument("--source", help="disc image: a path, file:// or http(s):// URL")
+    r.add_argument("--source", help="disc image, a .zip holding one, or a .zip of the disc's"
+                                    " files (default.xbe at its root): a path, file:// or"
+                                    " http(s):// URL")
     r.add_argument("--sha256", help="expected SHA-256 of the image, or of the .zip it comes in"
                                     " (strongly recommended)")
     r.add_argument("--sha1", help="expected SHA-1 of the image or its .zip, as disc databases"
@@ -391,8 +408,8 @@ def main(argv=None):
     r.add_argument("--to", dest="stop", choices=STAGES, default="verify")
     r.add_argument("--only", choices=STAGES)
     r.add_argument("--drop-image", action="store_true",
-                   help="intake: delete the work directory's copy of the image once it is"
-                        " verified and extracted (CI: a full-disc dump is several GB)")
+                   help="intake: delete the work directory's copy of the image (or zip) once"
+                        " it is verified and extracted (CI: a full-disc dump is several GB)")
     r.add_argument("--split", type=int, default=250, help="functions per generated C file")
     r.add_argument("--game-config", help="project: a profile JSON merged into xbr_game.json")
     r.add_argument("--host-seconds", type=int, default=20,
