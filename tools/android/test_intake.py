@@ -380,6 +380,33 @@ class PipelineIntakeFlags(unittest.TestCase):
         md = compat.to_markdown(compat.build(work))
         self.assertIn("verified against the supplied SHA-1 of the image", md)
 
+    def test_drop_image_removes_only_the_work_copy(self):
+        work = os.path.join(self.tmp.name, "w")
+        self.assertEqual(self._run(work, "--sha1", _sha1(self.img), "--drop-image"), 0)
+        self.assertFalse(os.path.lexists(os.path.join(work, "input", "disc.iso")))
+        self.assertTrue(os.path.exists(self.img))          # the user's own file stays
+        man = self._json(work, "game_manifest.json")
+        self.assertTrue(man["image"]["dropped_after_extraction"])
+        self.assertEqual(man["image"]["sha1"], _sha1(self.img))
+        self.assertTrue(os.path.exists(os.path.join(work, "game", man["default_xbe"])))
+        # Without the flag the image is kept.
+        work2 = os.path.join(self.tmp.name, "w2")
+        self.assertEqual(self._run(work2, "--sha1", _sha1(self.img)), 0)
+        self.assertTrue(os.path.lexists(os.path.join(work2, "input", "disc.iso")))
+
+    def test_game_too_large_for_an_apk_is_refused_early(self):
+        from tools.android import apk
+        work = os.path.join(self.tmp.name, "w")
+        self.assertEqual(self._run(work, "--sha1", _sha1(self.img)), 0)
+        man_path = os.path.join(work, "game_manifest.json")
+        man = self._json(man_path)
+        man["files"].append({"path": "huge.bin", "size": apk.APK_GAME_BYTES_MAX})
+        with open(man_path, "w", encoding="utf-8") as f:
+            json.dump(man, f)
+        with self.assertRaises(apk.ApkError) as cm:
+            apk.stage_assets(work, os.path.join(self.tmp.name, "app"), log=lambda *a: None)
+        self.assertIn("under 4 GiB", str(cm.exception))
+
     def test_sha1_flag_mismatch_fails_the_stage(self):
         work = os.path.join(self.tmp.name, "w")
         self.assertEqual(self._run(work, "--sha256", _sha(self.img), "--sha1", "3" * 40), 1)

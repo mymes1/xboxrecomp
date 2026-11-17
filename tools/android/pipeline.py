@@ -138,6 +138,17 @@ def stage_intake(ctx):
     manifest["image"] = {k: info[k] for k in ("sha256", "sha1", "size", "source", "verified",
                                               "verified_with", "matched", "container")}
     manifest["detect"] = det
+    if getattr(a, "drop_image", False):
+        # A full-disc dump is several GB and nothing after intake reads it:
+        # its digests are recorded here. Only the work directory's entry
+        # goes (input/disc.iso: a download, a copy or a link -- never the
+        # user's own file).
+        inside = os.path.abspath(info["path"]).startswith(os.path.abspath(ctx.path("input")) + os.sep)
+        if inside and os.path.lexists(info["path"]):
+            os.remove(info["path"])
+            manifest["image"]["dropped_after_extraction"] = True
+            ctx.log("image removed after extraction (--drop-image); its digests are in"
+                    " reports/intake.json")
     iso.write_json(ctx.path("game_manifest.json"), manifest)
     iso.write_json(os.path.join(ctx.reports, "intake.json"), {
         "image": manifest["image"], "detect": det, "file_count": manifest["file_count"],
@@ -379,6 +390,9 @@ def main(argv=None):
     r.add_argument("--from", dest="start", choices=STAGES, default="intake")
     r.add_argument("--to", dest="stop", choices=STAGES, default="verify")
     r.add_argument("--only", choices=STAGES)
+    r.add_argument("--drop-image", action="store_true",
+                   help="intake: delete the work directory's copy of the image once it is"
+                        " verified and extracted (CI: a full-disc dump is several GB)")
     r.add_argument("--split", type=int, default=250, help="functions per generated C file")
     r.add_argument("--game-config", help="project: a profile JSON merged into xbr_game.json")
     r.add_argument("--host-seconds", type=int, default=20,

@@ -364,6 +364,25 @@ jobs:
         with:
           python-version: "3.12"
 
+      # A full-disc dump is about 7.3 GiB, and the game files then exist
+      # three times (extracted, Gradle's merged assets, the stored APK): the
+      # work directory goes on the runner's larger disk when there is one.
+      - name: Room for a full-size disc image
+        if: steps.src.outputs.have == '1'
+        run: |
+          df -h / /mnt 2>/dev/null || true
+          mkdir -p build/games
+          root_free=$(df --output=avail -B1 . | tail -1)
+          mnt_free=$(df --output=avail -B1 /mnt 2>/dev/null | tail -1 || echo 0)
+          if [ "${mnt_free:-0}" -gt "$root_free" ]; then
+            sudo mkdir -p /mnt/xbr-user
+            sudo chown "$(id -u):$(id -g)" /mnt/xbr-user
+            ln -sfn /mnt/xbr-user build/games/user
+            echo "work directory on /mnt ($((mnt_free / 1024**3)) GiB free there)"
+          else
+            echo "work directory on the workspace disk ($((root_free / 1024**3)) GiB free)"
+          fi
+
       - name: Bootstrap pinned dependencies (verified, Gradle included)
         if: steps.src.outputs.have == '1'
         run: bash tools/android/bootstrap.sh --no-sdk --dev
@@ -391,7 +410,8 @@ jobs:
           want=$(python3 -c "import json;print(json.load(open('tools/android/deps.lock.json'))['android']['ndk']['revision'])")
           python3 -m tools.android.pipeline run --source "$url" "${digests[@]}" \
             --work build/games/user --to verify --native-mode ndk --ndk "$ANDROID_HOME/ndk/$want" \
-            --host-seconds 60
+            --host-seconds 60 --drop-image
+          df -h . || true
 
       - name: Report
         if: always() && steps.src.outputs.have == '1'

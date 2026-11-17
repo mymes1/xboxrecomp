@@ -115,10 +115,21 @@ def _link_or_copy(src, dst):
         shutil.copyfile(src, dst)
 
 
+# The game files travel inside the APK. apksigner cannot sign a ZIP64 archive,
+# so the whole APK has to stay under 4 GiB; leave room for the libraries.
+APK_GAME_BYTES_MAX = 4 * 1024 ** 3 - 256 * 1024 ** 2
+
+
 def stage_assets(work, app, log=print):
     """assets/game <- <work>/game per the intake manifest; assets/xbr/game_files.json."""
     with open(os.path.join(work, "game_manifest.json"), encoding="utf-8") as f:
         man = json.load(f)
+    need = sum(e["size"] for e in man["files"])
+    if need > APK_GAME_BYTES_MAX:
+        raise ApkError("the game files are %.2f GiB; they are packaged inside the APK, which"
+                       " must stay under 4 GiB to be signed and installed (apksigner has no"
+                       " ZIP64). Delivering larger games next to the APK is not implemented."
+                       % (need / 1024.0 ** 3))
     assets = os.path.join(app, "app", "src", "main", "assets")
     game = os.path.join(assets, "game")
     if os.path.exists(game):
