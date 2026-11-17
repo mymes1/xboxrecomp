@@ -27,12 +27,12 @@ up and right, Start.
 
 --game-zip, for an APK built with its game files left out (apk.py
 --game-files external): the app's data is cleared so nothing is left from an
-earlier install, the launcher is started once (since Android 11 only the app
-itself can create its shared-storage folders), the zip of the game's files is
-pushed to its OBB folder (Android/obb/<package>/game.zip, else
-Android/data/<package>/files/game.zip -- where the launcher looks before it
-offers the file picker), and the launcher's "[FILES] imported ..." line --
-every file matched its SHA-256 -- is required (files_import in the report).
+earlier install, the zip of the game's files is sent the way a user sends it
+over adb -- `adb exec-in content write --uri content://<package>.gamezip/
+game.zip` into the app's GameZipProvider (since Android 11 adb cannot reach
+Android/obb or Android/data; on older systems the OBB folder is tried too) --
+and the launcher's "[FILES] imported ..." line, every file matched its
+SHA-256, is required (files_import in the report).
 """
 
 import argparse
@@ -82,6 +82,18 @@ class Adb:
             raise DeviceError("%s failed (%d): %s" % (" ".join(full), r.returncode,
                                                       (r.stdout or "")[-1500:]))
         return r.stdout
+
+    def feed(self, path, *args, timeout=3600):
+        """Run an adb command with a local file as its standard input (binary:
+        `adb exec-in` hands it to the device command unchanged)."""
+        full = [self.exe] + (["-s", self.serial] if self.serial else []) + list(args)
+        try:
+            with open(path, "rb") as f:
+                r = subprocess.run(full, stdin=f, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"rc": None, "output": "timed out after %ds" % timeout}
+        return {"rc": r.returncode, "output": r.stdout.decode("utf-8", "replace")}
 
     def prop(self, name):
         return self.cmd("shell", "getprop", name, check=False).strip()
@@ -224,25 +236,34 @@ def _lifecycle(adb, serial, pkg, log, selftest):
 
 
 def _place_game_zip(adb, pkg, game_zip, log):
-    """Clear the app, let it create its folders, and push the zip into one."""
+    """Clear the app, then send it the zip as a user would over adb."""
     # A clean start, so the files can only come from the zip.
     adb.cmd("shell", "pm", "clear", pkg, check=False)
-    # Since Android 11 the shell cannot create Android/obb/<pkg> or
-    # Android/data/<pkg>; the launcher creates both when it starts.
+    out = {"file": os.path.basename(game_zip), "size": os.path.getsize(game_zip), "tries": []}
+    uri = "content://%s.gamezip/game.zip" % pkg
+    r = adb.feed(game_zip, "exec-in", "content", "write", "--uri", uri)
+    ok = r["rc"] == 0 and not re.search(r"error|exception|denied", r["output"], re.I)
+    out["tries"].append({"to": uri, "ok": ok, "output": r["output"][-300:], "rc": r["rc"]})
+    if ok:
+        out["sent_to"] = uri
+        log("game files: %s sent over adb to %s for the launcher to import" % (game_zip, uri))
+        return out
+    log("game files: content write to %s failed (rc %s): %s" % (uri, r["rc"], r["output"][-200:]))
+    # Up to Android 10 the shell may write the app's OBB folder, once the
+    # app has created it (the launcher does when it starts).
     adb.cmd("shell", "am", "start", "-W", "-a", "android.intent.action.MAIN",
             "-c", "android.intent.category.LAUNCHER", "-n", "%s/%s" % (pkg, PKG_ACTIVITY),
             check=False, timeout=180)
     time.sleep(3)
-    out = {"file": os.path.basename(game_zip), "size": os.path.getsize(game_zip), "tries": []}
-    for d in ("/sdcard/Android/obb/%s" % pkg, "/sdcard/Android/data/%s/files" % pkg):
-        r = adb.cmd("push", game_zip, d + "/game.zip", check=False, timeout=3600).strip()
-        ok = "error" not in r.lower() and "failed" not in r.lower()
-        out["tries"].append({"to": d + "/game.zip", "ok": ok, "push": r[-300:]})
-        if ok:
-            out["pushed_to"] = d + "/game.zip"
-            log("game files: %s pushed to %s/game.zip for the launcher to import" % (game_zip, d))
-            break
-        log("game files: push to %s failed: %s" % (d, r[-200:]))
+    d = "/sdcard/Android/obb/%s" % pkg
+    r2 = adb.cmd("push", game_zip, d + "/game.zip", check=False, timeout=3600).strip()
+    ok = "error" not in r2.lower() and "failed" not in r2.lower()
+    out["tries"].append({"to": d + "/game.zip", "ok": ok, "output": r2[-300:]})
+    if ok:
+        out["sent_to"] = d + "/game.zip"
+        log("game files: %s pushed to %s/game.zip" % (game_zip, d))
+    else:
+        log("game files: push to %s failed: %s" % (d, r2[-200:]))
     return out
 
 

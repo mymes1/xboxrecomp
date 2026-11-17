@@ -44,7 +44,7 @@ on:
         required: false
         default: ""
       upload_apk:
-        description: "Also upload the APK and native libraries. They contain the game (code and files): on a public repository, anyone signed in to GitHub can download artifacts."
+        description: "Also upload the APK and native libraries. They contain the game's recompiled code, and its files when they fit in the APK (over 3.75 GiB the launcher imports them from your zip): on a public repository, anyone signed in to GitHub can download artifacts."
         type: boolean
         required: false
         default: false
@@ -228,8 +228,8 @@ jobs:
           target: google_apis
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          # Second run: the APK without its game files; they are imported from
-          # a zip pushed to the app's OBB folder, then the title must boot.
+          # Second run: the APK without its game files; they are sent over adb
+          # (content write) and imported by the launcher, then the title must boot.
           script: |
             python3 -m tools.android.device_run --work build/games/xbrtest --seconds 90 --touch --lifecycle --env RECOMP_AC97_READY=1 || echo "device run reported a failure"
             python3 -m tools.android.device_run --work build/games/xbrtest-external --seconds 60 --game-zip build/games/xbrtest-external/xbrtest-files.zip || echo "device run (game files imported from a zip) reported a failure"

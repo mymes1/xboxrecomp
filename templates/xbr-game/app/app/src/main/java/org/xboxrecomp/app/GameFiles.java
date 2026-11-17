@@ -120,12 +120,18 @@ final class GameFiles {
     }
 
     /**
-     * A zip of the game's files put where adb or a computer's file manager
-     * can place it without any permission: the app's OBB folder
-     * (Android/obb/&lt;package&gt;/game.zip) or its files folder
-     * (Android/data/&lt;package&gt;/files/game.zip). Null when there is none.
+     * A zip of the game's files already on the device: sent over adb
+     * (GameZipProvider, into private storage), or placed in the app's OBB
+     * folder (Android/obb/&lt;package&gt;/game.zip) or files folder
+     * (Android/data/&lt;package&gt;/files/game.zip) -- reachable by adb up
+     * to Android 10, and by file managers that may write there. Null when
+     * there is none.
      */
     static File sideloadedZip(Context c) {
+        File sent = GameZipProvider.incoming(c);
+        if (sent.isFile() && sent.length() > 0) {
+            return sent;
+        }
         for (File d : new File[] { c.getObbDir(), c.getExternalFilesDir(null) }) {
             if (d != null) {
                 File z = new File(d, "game.zip");

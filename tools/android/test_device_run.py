@@ -58,37 +58,45 @@ class DeviceRunParsersTest(unittest.TestCase):
         self.assertFalse(need["ok"])
         self.assertEqual(device_run.parse_files_lines("")["imported"], None)
 
-    def test_game_zip_placement_falls_back_to_the_files_folder(self):
+    def test_game_zip_is_sent_over_adb_content_write(self):
         import os
         import tempfile
         from unittest import mock
 
         class FakeAdb:
-            def __init__(self):
-                self.calls = []
+            def __init__(self, provider_ok):
+                self.calls, self.fed, self.provider_ok = [], [], provider_ok
 
             def cmd(self, *args, **kw):
                 self.calls.append(args)
-                if args[0] == "push" and "/Android/obb/" in args[2]:
-                    return ("x.zip: 1 file pushed, 0 skipped.\nadb: error: failed to copy 'x.zip'"
-                            " to '/sdcard/Android/obb/p/game.zip': remote secure_mkdirs failed:"
-                            " Permission denied")
-                if args[0] == "push":
-                    return "x.zip: 1 file pushed, 0 skipped. 1.0 MB/s"
-                return ""
+                return "x.zip: 1 file pushed, 0 skipped. 1.0 MB/s" if args[0] == "push" else ""
+
+            def feed(self, path, *args, **kw):
+                self.calls.append(args)
+                with open(path, "rb") as f:
+                    self.fed.append(f.read())
+                if self.provider_ok:
+                    return {"rc": 0, "output": ""}
+                return {"rc": 1, "output": "[ERROR] Unable to find provider info for p.gamezip"}
 
         with tempfile.NamedTemporaryFile(suffix=".zip") as z:
             z.write(b"PK\x05\x06" + b"\0" * 18)
             z.flush()
-            adb = FakeAdb()
-            with mock.patch.object(device_run.time, "sleep"):
-                out = device_run._place_game_zip(adb, "p", z.name, log=lambda *a: None)
+            adb = FakeAdb(True)
+            out = device_run._place_game_zip(adb, "p", z.name, log=lambda *a: None)
             self.assertEqual(out["size"], os.path.getsize(z.name))
-        self.assertEqual(out["pushed_to"], "/sdcard/Android/data/p/files/game.zip")
-        self.assertEqual([t["ok"] for t in out["tries"]], [False, True])
-        kinds = [c[0] if c[0] != "shell" else " ".join(c[1:3]) for c in adb.calls]
-        # cleared, started once (so the app creates its folders), then pushed
-        self.assertEqual(kinds, ["pm clear", "am start", "push", "push"])
+            self.assertEqual(adb.fed, [b"PK\x05\x06" + b"\0" * 18])     # byte for byte
+            # An older system without the provider route: the OBB folder.
+            old = FakeAdb(False)
+            with mock.patch.object(device_run.time, "sleep"):
+                out2 = device_run._place_game_zip(old, "p", z.name, log=lambda *a: None)
+        self.assertEqual(out["sent_to"], "content://p.gamezip/game.zip")
+        self.assertEqual(adb.calls, [("shell", "pm", "clear", "p"),
+                                     ("exec-in", "content", "write", "--uri",
+                                      "content://p.gamezip/game.zip")])
+        self.assertEqual(out2["sent_to"], "/sdcard/Android/obb/p/game.zip")
+        self.assertEqual([t["ok"] for t in out2["tries"]], [False, True])
+        self.assertEqual([c[0] for c in old.calls], ["shell", "exec-in", "shell", "push"])
 
     def test_report_fails_when_a_requested_import_failed(self):
         import json

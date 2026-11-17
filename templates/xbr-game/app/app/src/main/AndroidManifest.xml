@@ -53,5 +53,14 @@
             android:preferMinimalPostProcessing="true"
             android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
             android:theme="@style/XbrGameTheme" />
+
+        <!-- The game's files over adb, for an APK built without them:
+             `adb exec-in content write --uri content://<package>.gamezip/game.zip`.
+             Exported so the shell's content tool reaches it; it accepts the
+             shell and root users only (GameZipProvider). -->
+        <provider
+            android:name=".GameZipProvider"
+            android:authorities="${applicationId}.gamezip"
+            android:exported="true" />
     </application>
 </manifest>

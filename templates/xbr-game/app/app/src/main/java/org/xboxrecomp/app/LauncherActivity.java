@@ -45,9 +45,9 @@ import java.util.ArrayList;
  * the game in its own process, and reports how the last run ended.
  *
  * Game files too large for an APK are not in it (GameFiles): the first Play
- * imports them from a zip of the game's files -- one placed in the app's own
- * folder (Android/obb/&lt;package&gt;/game.zip, e.g. by adb), else one the
- * user picks with the system file picker.
+ * imports them from a zip of the game's files -- one sent over adb
+ * (GameZipProvider) or placed in the app's OBB folder, else one the user
+ * picks with the system file picker.
  *
  * Automation: start with the boolean extra AUTOSTART to install and launch
  * without a tap (CI runs on an emulator use it), and a String[] extra ENV of
@@ -372,7 +372,8 @@ public class LauncherActivity extends Activity {
             return;
         }
         if (autostart) {
-            Log.i(TAG, "[FILES] game files needed: not in the APK, and no game.zip in "
+            Log.i(TAG, "[FILES] game files needed: not in the APK, none sent over adb (content://"
+                    + getPackageName() + ".gamezip/game.zip), and no game.zip in "
                     + getObbDir() + " or " + getExternalFilesDir(null));
             status.setText(getString(R.string.first_run_external, GameFiles.describe(this)));
             return;

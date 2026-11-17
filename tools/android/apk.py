@@ -400,7 +400,8 @@ def verify(work, apk=None, log=print):
     classes = {}
     blob = b"".join(zf.read(n) for n in dex)
     for c in ("Lorg/xboxrecomp/app/LauncherActivity;", "Lorg/xboxrecomp/app/XbrGameActivity;",
-              "Lorg/xboxrecomp/app/GameFiles;", "Lorg/libsdl/app/SDLActivity;"):
+              "Lorg/xboxrecomp/app/GameFiles;", "Lorg/xboxrecomp/app/GameZipProvider;",
+              "Lorg/libsdl/app/SDLActivity;"):
         classes[c] = c.encode() in blob
         if not classes[c]:
             problems.append("dex lacks %s" % c)
