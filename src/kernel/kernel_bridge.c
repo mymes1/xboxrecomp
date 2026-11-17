@@ -31,6 +31,7 @@
 #include "xbox_memory_layout.h"
 #include "platform/host_time.h"
 #include "recomp_icall_feedback.h"
+#include "kernel_recent.h"   /* [android-port] last kernel calls for crash reports */
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -396,6 +397,145 @@ static long kernel_log_budget(void)
             budget = 0;
     }
     return budget;
+}
+
+/* [android-port] The last kernel calls, for the crash report; see
+ * kernel_recent.h. The log above covers the first calls, this the last. */
+static xbox_kernel_recent_t g_krecent[XBOX_KERNEL_RECENT];
+static volatile long long g_krecent_next;      /* calls recorded so far */
+static volatile long g_krecent_threads;        /* threads numbered so far */
+static RECOMP_TLS uint32_t t_krecent_thread;
+
+static int krecent_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *env = getenv("RECOMP_KERNEL_RECENT");
+        on = !(env && env[0] == '0');
+    }
+    return on;
+}
+
+static long long krecent_take(void)
+{
+#if defined(_MSC_VER)
+    return InterlockedIncrement64((volatile LONG64 *)&g_krecent_next);
+#else
+    return __atomic_add_fetch(&g_krecent_next, 1, __ATOMIC_RELAXED);
+#endif
+}
+
+uint32_t xbox_KernelRecentThread(void)
+{
+    return t_krecent_thread;
+}
+
+/* The object name a file or symbolic-link call was given, copied out of
+ * guest memory: OBJECT_ATTRIBUTES { RootDirectory, ObjectName, Attributes }
+ * with ObjectName an OBJECT_STRING { USHORT Length, MaximumLength; PCHAR
+ * Buffer }. The bridge itself reads the same structures right after. */
+static void krecent_name(xbox_kernel_recent_t *e, uint32_t ordinal, uint32_t esp)
+{
+    uint32_t str = 0, len, buf, i;
+    int oa = -1;
+    switch (ordinal) {
+    case 190: case 202: case 66: oa = 2; break;   /* NtCreateFile, NtOpenFile, IoCreateFile */
+    case 210: case 195:          oa = 0; break;   /* NtQueryFullAttributesFile, NtDeleteFile */
+    case 203:                    oa = 1; break;   /* NtOpenSymbolicLinkObject */
+    case 67: case 69:                             /* Io{Create,Delete}SymbolicLink(STRING *) */
+        str = BRIDGE_MEM32(esp);
+        break;
+    default:
+        return;
+    }
+    if (oa >= 0) {
+        uint32_t attrs = BRIDGE_MEM32(esp + 4u * (uint32_t)oa);
+        if (attrs < 0x10000u)
+            return;
+        str = BRIDGE_MEM32(attrs + 4);
+    }
+    if (str < 0x10000u)
+        return;
+    len = BRIDGE_MEM16(str);
+    buf = BRIDGE_MEM32(str + 4);
+    if (buf < 0x10000u)
+        return;
+    if (len > sizeof e->name - 1)
+        len = sizeof e->name - 1;
+    for (i = 0; i < len; i++) {
+        uint8_t c = BRIDGE_MEM8(buf + i);
+        e->name[i] = (char)(c >= 0x20 && c < 0x7F ? c : '?');
+    }
+    e->name[len] = 0;
+}
+
+/* Called with g_esp at the first argument (the return address popped). */
+static xbox_kernel_recent_t *krecent_begin(uint32_t ordinal, uint32_t caller)
+{
+    xbox_kernel_recent_t *e;
+    long long n, last;
+    int k;
+    if (!krecent_on())
+        return NULL;
+    if (!t_krecent_thread) {
+#if defined(_MSC_VER)
+        t_krecent_thread = (uint32_t)InterlockedIncrement(&g_krecent_threads);
+#else
+        t_krecent_thread = (uint32_t)__atomic_add_fetch(&g_krecent_threads, 1, __ATOMIC_RELAXED);
+#endif
+    }
+    /* A repeat of one of the last two entries counts there. */
+    last = g_krecent_next;
+    for (k = 0; k < 2 && last - k >= 1; k++) {
+        e = &g_krecent[(unsigned long long)(last - k - 1) % XBOX_KERNEL_RECENT];
+        if (e->n == last - k && e->done && e->ordinal == ordinal && e->caller == caller
+                && e->thread == t_krecent_thread) {
+            e->repeat++;
+            e->done = 0;
+            e->arg[0] = g_esp ? BRIDGE_MEM32(g_esp) : 0;
+            e->arg[1] = g_esp ? BRIDGE_MEM32(g_esp + 4) : 0;
+            e->arg[2] = g_esp ? BRIDGE_MEM32(g_esp + 8) : 0;
+            return e;
+        }
+    }
+    n = krecent_take();
+    e = &g_krecent[(unsigned long long)(n - 1) % XBOX_KERNEL_RECENT];
+    e->n = 0;                       /* incomplete while it is rewritten */
+    e->done = 0;
+    e->repeat = 0;
+    e->ordinal = ordinal;
+    e->caller = caller;
+    e->thread = t_krecent_thread;
+    e->arg[0] = g_esp ? BRIDGE_MEM32(g_esp) : 0;
+    e->arg[1] = g_esp ? BRIDGE_MEM32(g_esp + 4) : 0;
+    e->arg[2] = g_esp ? BRIDGE_MEM32(g_esp + 8) : 0;
+    e->result = 0;
+    e->name[0] = 0;
+    if (g_esp)
+        krecent_name(e, ordinal, g_esp);
+    e->n = n;
+    return e;
+}
+
+static void krecent_end(xbox_kernel_recent_t *e, long long n)
+{
+    /* Unless 32 newer calls have taken the slot meanwhile (a long wait). */
+    if (e && e->n == n) {
+        e->result = g_eax;
+        e->done = 1;
+    }
+}
+
+int xbox_KernelRecentGet(int i, xbox_kernel_recent_t *out)
+{
+    long long last = g_krecent_next;
+    long long n = last - (XBOX_KERNEL_RECENT - 1) + i;
+    const xbox_kernel_recent_t *e;
+    if (i < 0 || i >= XBOX_KERNEL_RECENT || n < 1)
+        return 0;
+    e = &g_krecent[(unsigned long long)(n - 1) % XBOX_KERNEL_RECENT];
+    *out = *e;
+    return out->n != 0;
 }
 
 #define KERNEL_LOG_ON()      (g_kernel_call_count <= kernel_log_budget())
@@ -10954,6 +11094,10 @@ static void kernel_thunk_dispatch_body(void)
     g_xbox_kernel_caller = g_esp ? BRIDGE_MEM32(g_esp) : 0;
     g_esp += 4;
 
+    /* [android-port] Recorded for the crash report (kernel_recent.h). */
+    xbox_kernel_recent_t *_recent = krecent_begin(ordinal, g_xbox_kernel_caller);
+    long long _recent_n = _recent ? _recent->n : 0;
+
     /* Name the bridge that corrupts a watched dword.
      *
      * A bridge hands Xbox pointers to real Win32 calls, so a bad one has
@@ -11030,6 +11174,8 @@ static void kernel_thunk_dispatch_body(void)
             fflush(stderr);
         }
     }
+
+    krecent_end(_recent, _recent_n);   /* [android-port] */
 
     if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] → returned 0x%08X\n", g_eax);

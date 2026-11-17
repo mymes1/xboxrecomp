@@ -170,6 +170,7 @@ jobs:
             build/games/xbrtest-external/out/*.apk
             build/games/xbrtest-external/project/xbr_game.json
             build/games/xbrtest-external/game_manifest.json
+            build/games/xbrtest-external/pipeline_state.json
             build/games/xbrtest-external/xbrtest-files.zip
           if-no-files-found: warn
 

@@ -61,7 +61,8 @@ def summarize(work, name, extra=None):
         keep = {k: hr.get(k) for k in ("platform", "entry_reached", "exit", "seconds", "flips",
                                        "display_changes", "selftest", "failed_step")}
         keep["boot"] = hr.get("boot", [])[-25:]
-        keep["crash"] = hr.get("crash", [])[:30]
+        keep["crash"] = hr.get("crash", [])[:70]
+        keep["kernel_log"] = hr.get("kernel_log", [])[-30:]
         keep["unimpl"] = hr.get("unimpl", [])[:10]
         keep["title_lines"] = hr.get("title_lines", [])[:30]
         keep["status"] = hr.get("status", [])[-4:]
@@ -73,7 +74,7 @@ def summarize(work, name, extra=None):
                                        "exit", "seconds", "flips", "display_changes", "selftest",
                                        "failed_step", "game_process_alive_at_end")}
         keep["boot"] = rt.get("boot", [])[-30:]
-        keep["crash"] = rt.get("crash", [])[:40]
+        keep["crash"] = rt.get("crash", [])[:70]
         keep["fatal_lines"] = rt.get("fatal_lines", [])[:20]
         keep["title_lines"] = rt.get("title_lines", [])[:30]
         keep["status"] = rt.get("status", [])[-4:]
@@ -123,6 +124,9 @@ def summarize(work, name, extra=None):
     if len(text) > LIMIT:
         text = text[:LIMIT - 200] + "\n\n... (truncated; full reports are in the artifact)\n"
     ok = bool(st["stages"]) and not failed
+    # A run asked to import the game files from a zip fails when it did not.
+    if rt and "files_import" in rt and not rt["files_import"].get("ok"):
+        ok = False
     return text, ok
 
 

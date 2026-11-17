@@ -27,8 +27,10 @@ up and right, Start.
 
 --game-zip, for an APK built with its game files left out (apk.py
 --game-files external): the app's data is cleared so nothing is left from an
-earlier install, the zip of the game's files is pushed to the app's OBB
-folder (Android/obb/<package>/game.zip, where the launcher looks before it
+earlier install, the launcher is started once (since Android 11 only the app
+itself can create its shared-storage folders), the zip of the game's files is
+pushed to its OBB folder (Android/obb/<package>/game.zip, else
+Android/data/<package>/files/game.zip -- where the launcher looks before it
 offers the file picker), and the launcher's "[FILES] imported ..." line --
 every file matched its SHA-256 -- is required (files_import in the report).
 """
@@ -221,6 +223,29 @@ def _lifecycle(adb, serial, pkg, log, selftest):
     return out
 
 
+def _place_game_zip(adb, pkg, game_zip, log):
+    """Clear the app, let it create its folders, and push the zip into one."""
+    # A clean start, so the files can only come from the zip.
+    adb.cmd("shell", "pm", "clear", pkg, check=False)
+    # Since Android 11 the shell cannot create Android/obb/<pkg> or
+    # Android/data/<pkg>; the launcher creates both when it starts.
+    adb.cmd("shell", "am", "start", "-W", "-a", "android.intent.action.MAIN",
+            "-c", "android.intent.category.LAUNCHER", "-n", "%s/%s" % (pkg, PKG_ACTIVITY),
+            check=False, timeout=180)
+    time.sleep(3)
+    out = {"file": os.path.basename(game_zip), "size": os.path.getsize(game_zip), "tries": []}
+    for d in ("/sdcard/Android/obb/%s" % pkg, "/sdcard/Android/data/%s/files" % pkg):
+        r = adb.cmd("push", game_zip, d + "/game.zip", check=False, timeout=3600).strip()
+        ok = "error" not in r.lower() and "failed" not in r.lower()
+        out["tries"].append({"to": d + "/game.zip", "ok": ok, "push": r[-300:]})
+        if ok:
+            out["pushed_to"] = d + "/game.zip"
+            log("game files: %s pushed to %s/game.zip for the launcher to import" % (game_zip, d))
+            break
+        log("game files: push to %s failed: %s" % (d, r[-200:]))
+    return out
+
+
 def parse_files_lines(text):
     """The launcher's [FILES] lines: game file installation or import."""
     lines = [l.strip() for l in text.splitlines() if l.strip().startswith("[FILES]")]
@@ -271,16 +296,11 @@ def run(work, seconds=60, serial=None, extra_env=None, log=print, lifecycle=Fals
         raise DeviceError("install failed: %s" % install.strip()[-500:])
 
     if game_zip:
-        # A clean start, so the files can only come from the zip.
-        adb.cmd("shell", "pm", "clear", pkg, check=False)
-        adb.cmd("shell", "rm", "-rf", "/sdcard/Android/data/%s/files/game" % pkg, check=False)
-        obb = "/sdcard/Android/obb/%s" % pkg
-        adb.cmd("shell", "mkdir", "-p", obb, check=False)
-        pushed = adb.cmd("push", game_zip, obb + "/game.zip", check=False, timeout=3600)
-        rep["game_zip"] = {"file": os.path.basename(game_zip), "size": os.path.getsize(game_zip),
-                           "pushed_to": obb + "/game.zip", "push": pushed.strip()[-300:]}
-        log("game files: %s pushed to %s/game.zip for the launcher to import" % (game_zip, obb))
+        rep["game_zip"] = _place_game_zip(adb, pkg, game_zip, log)
 
+    # Nothing of an earlier run may reach this run's log.
+    adb.cmd("shell", "am", "force-stop", pkg, check=False)
+    time.sleep(2)
     adb.cmd("logcat", "-c", check=False)
     env = ["RECOMP_STATUS_SECS=2", "RECOMP_STATUS_BMP=display.bmp",
            "RECOMP_KERNEL_LOG_BUDGET=400"] + (["RECOMP_INPUT_TRACE=1", "XBR_TOUCH=on"]

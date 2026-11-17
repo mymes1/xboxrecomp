@@ -78,6 +78,11 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        // The app's own shared-storage folders exist once the app asks for
+        // them; only then can a zip be placed there over USB or adb (since
+        // Android 11 nothing else may create them).
+        getObbDir();
+        getExternalFilesDir(null);
         setContentView(buildUi());
         handle(getIntent());
     }

@@ -166,6 +166,34 @@ class BootLogTest(unittest.TestCase):
         self.assertTrue(r["failed_step"].startswith("FAILED"))
         self.assertEqual(r["flips"], 0)
 
+    def test_crash_lines_name_kernel_ordinals(self):
+        r = native.parse_boot_log(
+            "[CRASH] signal 11 at host pc 0x1, fault address 0x2 (boot stage: running title)\n"
+            "[CRASH]   last kernel calls (oldest first; t<n> = thread, * = this one):\n"
+            "[CRASH]     t1* ordinal 190 (00FDE3A0, 80100080, 00FDE390)"
+            " \"\\Device\\CdRom0\\media\\a.one\" from 0027A4E5 -> C0000034\n"
+            "[CRASH]     t2 ordinal 999 (00000000, 00000000, 00000000) from 00011000 x7 running\n")
+        self.assertEqual(len(r["crash"]), 4)
+        self.assertIn("ordinal 190 NtCreateFile (00FDE3A0", r["crash"][2])
+        self.assertIn("-> C0000034", r["crash"][2])
+        self.assertIn("ordinal 999 (", r["crash"][3])          # unknown: left as it is
+        self.assertEqual(native._name_ordinal(r["crash"][2]), r["crash"][2])   # once only
+
+    def test_kernel_log_lines(self):
+        d = tempfile.mkdtemp(prefix="xbrklog")
+        try:
+            p = os.path.join(d, "xbox_kernel.log")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("[10:00:00.000] INFO  [THUNK ] === Xbox Kernel Replacement Layer ===\n"
+                        "[10:00:01.000] ERROR [FILE  ] NtCreateFile: path translation failed\n"
+                        "[10:00:01.500] WARN  [MEM   ] something odd\n")
+            self.assertEqual(native.kernel_log_lines(p), [
+                "[10:00:01.000] ERROR [FILE  ] NtCreateFile: path translation failed",
+                "[10:00:01.500] WARN  [MEM   ] something odd"])
+            self.assertEqual(native.kernel_log_lines(os.path.join(d, "missing.log")), [])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
 
 @unittest.skipUnless(_zig(), "ziglang (requirements-dev.txt) not installed")
 class ElfInfoTest(unittest.TestCase):

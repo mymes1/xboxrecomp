@@ -58,6 +58,62 @@ class DeviceRunParsersTest(unittest.TestCase):
         self.assertFalse(need["ok"])
         self.assertEqual(device_run.parse_files_lines("")["imported"], None)
 
+    def test_game_zip_placement_falls_back_to_the_files_folder(self):
+        import os
+        import tempfile
+        from unittest import mock
+
+        class FakeAdb:
+            def __init__(self):
+                self.calls = []
+
+            def cmd(self, *args, **kw):
+                self.calls.append(args)
+                if args[0] == "push" and "/Android/obb/" in args[2]:
+                    return ("x.zip: 1 file pushed, 0 skipped.\nadb: error: failed to copy 'x.zip'"
+                            " to '/sdcard/Android/obb/p/game.zip': remote secure_mkdirs failed:"
+                            " Permission denied")
+                if args[0] == "push":
+                    return "x.zip: 1 file pushed, 0 skipped. 1.0 MB/s"
+                return ""
+
+        with tempfile.NamedTemporaryFile(suffix=".zip") as z:
+            z.write(b"PK\x05\x06" + b"\0" * 18)
+            z.flush()
+            adb = FakeAdb()
+            with mock.patch.object(device_run.time, "sleep"):
+                out = device_run._place_game_zip(adb, "p", z.name, log=lambda *a: None)
+            self.assertEqual(out["size"], os.path.getsize(z.name))
+        self.assertEqual(out["pushed_to"], "/sdcard/Android/data/p/files/game.zip")
+        self.assertEqual([t["ok"] for t in out["tries"]], [False, True])
+        kinds = [c[0] if c[0] != "shell" else " ".join(c[1:3]) for c in adb.calls]
+        # cleared, started once (so the app creates its folders), then pushed
+        self.assertEqual(kinds, ["pm clear", "am start", "push", "push"])
+
+    def test_report_fails_when_a_requested_import_failed(self):
+        import json
+        import os
+        import shutil
+        import tempfile
+        from tools.android import ci_report
+        d = tempfile.mkdtemp(prefix="xbrci")
+        try:
+            os.makedirs(os.path.join(d, "reports"))
+            with open(os.path.join(d, "pipeline_state.json"), "w") as f:
+                json.dump({"stages": {"apk": {"status": "ok"}, "verify": {"status": "ok"}}}, f)
+            rt = {"platform": "android-arm64-v8a", "files_import": {"ok": False, "problems": ["x"]}}
+            with open(os.path.join(d, "reports", "runtime_test.json"), "w") as f:
+                json.dump(rt, f)
+            text, ok = ci_report.summarize(d, "t")
+            self.assertFalse(ok)
+            self.assertIn('"files_import"', text)
+            rt["files_import"]["ok"] = True
+            with open(os.path.join(d, "reports", "runtime_test.json"), "w") as f:
+                json.dump(rt, f)
+            self.assertTrue(ci_report.summarize(d, "t")[1])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

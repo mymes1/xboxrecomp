@@ -22,6 +22,7 @@
 
 #include "kernel/xbox_memory_layout.h"
 #include "kernel/kernel.h"
+#include "kernel/kernel_recent.h"   /* the last kernel calls, for the crash report */
 #include "usb/ohci.h"           /* xbox_OhciInit: the controllers' USB host */
 #if XBR_HAVE_VULKAN
 #include "nv2a_vk.h"            /* src/vk: the NV2A render back end on Vulkan */
@@ -148,6 +149,36 @@ static void restore_default(int sig)
     sigaction(sig, &sa, NULL);
 }
 
+/* What the kernel last told the title (kernel_recent.h): the call log goes
+ * quiet after its budget, so without this a crash later in a boot has no
+ * kernel context at all. Oldest first; "*" marks the crashing thread's
+ * calls, "running" a call that had not returned (a wait, or the crash). */
+static void crash_kernel_recent(void)
+{
+    xbox_kernel_recent_t e;
+    uint32_t me = xbox_KernelRecentThread();
+    int i, shown = 0;
+    for (i = 0; i < XBOX_KERNEL_RECENT; i++) {
+        char times[24] = "";
+        if (!xbox_KernelRecentGet(i, &e))
+            continue;
+        if (!shown++)
+            crash_write("[CRASH]   last kernel calls (oldest first; t<n> = thread, * = this one):\n");
+        if (e.repeat)
+            snprintf(times, sizeof times, " x%u", e.repeat + 1);
+        if (e.done)
+            crash_write("[CRASH]     t%u%s ordinal %u (%08X, %08X, %08X)%s%s%s from %08X%s"
+                        " -> %08X\n", e.thread, e.thread == me ? "*" : "", e.ordinal,
+                        e.arg[0], e.arg[1], e.arg[2], e.name[0] ? " \"" : "", e.name,
+                        e.name[0] ? "\"" : "", e.caller, times, e.result);
+        else
+            crash_write("[CRASH]     t%u%s ordinal %u (%08X, %08X, %08X)%s%s%s from %08X%s"
+                        " running\n", e.thread, e.thread == me ? "*" : "", e.ordinal,
+                        e.arg[0], e.arg[1], e.arg[2], e.name[0] ? " \"" : "", e.name,
+                        e.name[0] ? "\"" : "", e.caller, times);
+    }
+}
+
 static void crash_handler(int sig, siginfo_t *si, void *ucv)
 {
     void *pc;
@@ -193,6 +224,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ucv)
         }
         crash_write("\n");
     }
+    crash_kernel_recent();
     /* Returning re-executes the access with the default disposition, so the
      * process dies by the original signal and its exit status says so. */
     restore_default(sig);

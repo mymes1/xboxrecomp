@@ -216,6 +216,37 @@ _STATUS = re.compile(r"^\[STATUS\] t=(\d+)s flips=(\d+) draws=(\d+) display=0x([
                      r"pitch=(\d+) fbsum=([0-9A-F]+) fbchanges=(\d+)")
 
 
+_KERNEL_NAMES = None
+_ORDINAL = re.compile(r"\bordinal (\d+)\b(?! [A-Z])")
+
+
+def _name_ordinal(line):
+    """'ordinal 190' -> 'ordinal 190 NtCreateFile' in a crash line (the
+    runtime's crash handler has no name table; the toolkit's parser has)."""
+    global _KERNEL_NAMES
+    if "ordinal " not in line:
+        return line
+    if _KERNEL_NAMES is None:
+        try:
+            from tools.xbe_parser.xbe_parser import KERNEL_EXPORTS
+            _KERNEL_NAMES = dict(KERNEL_EXPORTS)
+        except Exception:                       # names are a nicety
+            _KERNEL_NAMES = {}
+    return _ORDINAL.sub(lambda m: "ordinal %s %s" % (m.group(1), _KERNEL_NAMES[int(m.group(1))])
+                        if int(m.group(1)) in _KERNEL_NAMES else m.group(0), line)
+
+
+def kernel_log_lines(path, limit=60):
+    """ERROR and WARN lines of the kernel's own log (xbox_log writes it to
+    xbox_kernel.log in the working directory when it can, else stderr)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = [l.rstrip() for l in f if re.search(r"\] (ERROR|WARN) ", l)]
+    except OSError:
+        return []
+    return lines[-limit:]
+
+
 def parse_boot_log(text):
     """The [BOOT]/[STATUS]/[CRASH] protocol of src/host, from any host's log."""
     out = {"boot": [], "entry_reached": False, "title_returned": False, "crash": [],
@@ -266,7 +297,7 @@ def parse_boot_log(text):
         if line.startswith("[HOST] background") or line.startswith("[HOST] foreground"):
             out["lifecycle"].append(line[len("[HOST] "):].split(":")[0])
         if line.startswith("[CRASH]"):
-            out["crash"].append(line)
+            out["crash"].append(_name_ordinal(line))
         elif line.startswith("[UNIMPL]"):
             out["unimpl"].append(line)
         elif line.startswith("[ICALL]"):
@@ -324,6 +355,12 @@ def run_host(work, exe=None, seconds=20, log=print, extra_env=None):
     with open(logp, encoding="utf-8", errors="replace") as f:
         text = f.read()
     rep = parse_boot_log(text)
+    # The kernel's own log (xbox_log: errors and warnings such as a path that
+    # did not translate) goes to a file in the run directory; keep it.
+    klog = os.path.join(rundir, "xbox_kernel.log")
+    if os.path.exists(klog):
+        shutil.copyfile(klog, os.path.join(work, "reports", "logs", "host_kernel.log"))
+        rep["kernel_log"] = kernel_log_lines(klog)
     rep.update({
         "platform": host_platform(), "executable": exe, "seconds": round(dur, 1),
         "run_limit_seconds": seconds, "log": "reports/logs/host_run.log",

@@ -193,8 +193,10 @@ for counters and per-pipeline build times
   memory card or a cloud drive. The import needs room for the extracted
   files (as much again as the game's size). It checks every file against
   the SHA-256 recorded at build time, so a different version or region of
-  the game is refused with the file that differs. Without the picker: put
-  the zip at `Android/obb/<package>/game.zip`, with adb or a computer's file
+  the game is refused with the file that differs. Without the picker: start
+  the app once, so its folders exist (since Android 11 nothing else may
+  create them). Then put the zip at `Android/obb/<package>/game.zip`, or at
+  `Android/data/<package>/files/game.zip`, with adb or a computer's file
   manager over USB. The launcher imports it on Play, then deletes it.
 - **Controls**: with no controller connected, an on-screen controller is
   drawn over the game (Options -> On-screen controller: when no controller
