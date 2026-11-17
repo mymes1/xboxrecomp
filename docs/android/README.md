@@ -120,13 +120,17 @@ the secrets. `iso_url` may point to any of the three kinds of input above,
 including a zip of the disc's files. The URL need not end in `.zip`: a zip is
 recognised by its content.
 
-Size limit: the game's files are packaged inside the APK, and an APK must
+Large games: the game's files normally ride inside the APK, and an APK must
 stay under 4 GiB because apksigner cannot sign ZIP64 archives. A game with
 more than 3.75 GiB of files (the extracted files, not the image, which
-includes padding) therefore cannot be built into an APK yet. Intake warns
-right after extraction (`fits_in_apk` in `reports/intake.json`), the apk
-stage refuses, and the stages before it still run and report. Shipping large
-games next to the APK is not implemented.
+includes padding) is therefore built **without** its files
+(`--game-files auto`, the default; `bundle` and `external` force either).
+The APK then carries the recompiled code, the runtime and a list of every
+file with its size and SHA-256. On the first Play, the launcher imports the
+files from your zip of the game's files (see *Playing on the device*), and
+refuses any file that differs from the one the code was recompiled from.
+Intake already notes this (`fits_in_apk` in `reports/intake.json`), and
+`apk_verify.json` reports `game_files.mode`.
 
 ## Install and build
 
@@ -182,6 +186,16 @@ for counters and per-pipeline build times
 
 ## Playing on the device
 
+- **Game files for a large game** (APK built without them; the launcher says
+  so): tap Play, then *Choose zip*, and pick the zip of the game's files.
+  This is the same kind of zip the pipeline takes: `default.xbe` at its root
+  or in its one folder. The system file picker can open it from Downloads, a
+  memory card or a cloud drive. The import needs room for the extracted
+  files (as much again as the game's size). It checks every file against
+  the SHA-256 recorded at build time, so a different version or region of
+  the game is refused with the file that differs. Without the picker: put
+  the zip at `Android/obb/<package>/game.zip`, with adb or a computer's file
+  manager over USB. The launcher imports it on Play, then deletes it.
 - **Controls**: with no controller connected, an on-screen controller is
   drawn over the game (Options -> On-screen controller: when no controller
   is connected / always / never). A tap on a stick without moving clicks it.
@@ -203,5 +217,5 @@ for counters and per-pipeline build times
 
 The pipeline never fetches game content on its own. You supply the disc image
 (a path, or a URL to a copy you are entitled to use, with its SHA-256 or
-SHA-1), and the APK it produces contains that title's code and data: do not
-distribute it.
+SHA-1), and the APK it produces contains that title's code (recompiled) and,
+when the files are bundled, its data: do not distribute it.

@@ -7,6 +7,7 @@ import android.content.res.AssetManager;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -15,21 +16,46 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.security.MessageDigest;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipException;
+import java.util.zip.ZipInputStream;
 
 /**
- * Where the game's files live on the device, and their installation from the
- * APK's assets.
+ * Where the game's files live on the device, and how they get there.
  *
  * The runtime reads the disc through ordinary files (the D: drive is a
- * directory), so on first launch the files packed under assets/game are
- * copied to app-specific storage. assets/xbr/game_files.json lists every file
- * with its size; its "id" (a hash of that list) is written to a marker after a
- * complete copy, so a changed APK reinstalls and an interrupted copy resumes
- * from scratch instead of running on half a disc.
+ * directory), so the files are put in app-specific storage before the first
+ * start. assets/xbr/game_files.json lists every file with its size and
+ * SHA-256; its "id" (a hash of that list) is written to a marker after a
+ * complete install, so a changed APK reinstalls and an interrupted one starts
+ * over instead of running on half a disc.
+ *
+ * Two ways in, chosen when the APK was built (tools/android/apk.py):
+ *  - bundled: the files are in the APK under assets/game and are copied out;
+ *  - external (a game too large for an APK): the user supplies the zip of
+ *    the game's files -- default.xbe at its root, or in its one folder -- and
+ *    importZip() takes from it exactly the files of the list, each checked
+ *    against its size and SHA-256. Anything else in the zip is ignored; a
+ *    file that differs (another version or region of the game) stops the
+ *    import, because the recompiled code only fits the files it came from.
  */
 final class GameFiles {
     interface Progress {
         void update(long done, long total, String file);
+    }
+
+    /** What an import did, for the log. */
+    static final class Imported {
+        int files;
+        long bytes;
+        int ignored;
+        String folder;
     }
 
     private GameFiles() {}
@@ -71,6 +97,44 @@ final class GameFiles {
         return new JSONObject(readAsset(c, "xbr/game_files.json"));
     }
 
+    /** True when the files are inside the APK (false: they are imported). */
+    static boolean bundled(Context c) {
+        try {
+            return manifest(c).optBoolean("bundled", true);
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    /** "3.81 GB, 3884 files" for the import prompt. */
+    static String describe(Context c) {
+        try {
+            JSONObject m = manifest(c);
+            return String.format(Locale.ROOT, "%.2f GB, %d files", m.getLong("total_bytes") / 1e9,
+                    m.getJSONArray("files").length());
+        } catch (Exception e) {
+            return "?";
+        }
+    }
+
+    /**
+     * A zip of the game's files put where adb or a computer's file manager
+     * can place it without any permission: the app's OBB folder
+     * (Android/obb/&lt;package&gt;/game.zip) or its files folder
+     * (Android/data/&lt;package&gt;/files/game.zip). Null when there is none.
+     */
+    static File sideloadedZip(Context c) {
+        for (File d : new File[] { c.getObbDir(), c.getExternalFilesDir(null) }) {
+            if (d != null) {
+                File z = new File(d, "game.zip");
+                if (z.isFile()) {
+                    return z;
+                }
+            }
+        }
+        return null;
+    }
+
     /** True when every file of this APK's manifest is installed, complete. */
     static boolean installed(Context c) {
         try {
@@ -97,34 +161,60 @@ final class GameFiles {
         }
     }
 
+    private static File prepareRoot(Context c) throws IOException {
+        File root = gameDir(c);
+        if (!root.isDirectory() && !root.mkdirs()) {
+            throw new IOException("cannot create " + root);
+        }
+        File marker = new File(root, ".xbr_installed");
+        if (marker.exists() && !marker.delete()) {
+            throw new IOException("cannot reset " + marker);
+        }
+        return root;
+    }
+
+    /** The file for a manifest path, refusing anything outside the game directory. */
+    private static File target(File root, String rel) throws IOException {
+        File out = new File(root, rel);
+        if (!out.getCanonicalPath().startsWith(root.getCanonicalPath() + File.separator)) {
+            throw new IOException("refusing path outside the game directory: " + rel);
+        }
+        File parent = out.getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+            throw new IOException("cannot create " + parent);
+        }
+        return out;
+    }
+
+    private static void replace(File tmp, File out) throws IOException {
+        if (out.exists() && !out.delete()) {
+            throw new IOException("cannot replace " + out);
+        }
+        if (!tmp.renameTo(out)) {
+            throw new IOException("cannot rename " + tmp);
+        }
+    }
+
+    private static void markInstalled(File root, JSONObject m) throws Exception {
+        try (OutputStream os = new FileOutputStream(new File(root, ".xbr_installed"))) {
+            os.write(m.getString("id").getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    /** Bundled files: copy assets/game out of the APK. */
     static void install(Context c, Progress p) throws Exception {
         JSONObject m = manifest(c);
         JSONArray files = m.getJSONArray("files");
         long total = m.getLong("total_bytes");
         long done = 0;
-        File root = gameDir(c);
-        if (!root.isDirectory() && !root.mkdirs()) {
-            throw new IOException("cannot create " + root);
-        }
-        String rootPath = root.getCanonicalPath() + File.separator;
-        File marker = new File(root, ".xbr_installed");
-        if (marker.exists() && !marker.delete()) {
-            throw new IOException("cannot reset " + marker);
-        }
+        File root = prepareRoot(c);
         AssetManager am = c.getAssets();
         byte[] buf = new byte[1 << 20];
         for (int i = 0; i < files.length(); i++) {
             JSONObject f = files.getJSONObject(i);
             String rel = f.getString("path");
             long size = f.getLong("size");
-            File out = new File(root, rel);
-            if (!out.getCanonicalPath().startsWith(rootPath)) {
-                throw new IOException("refusing path outside the game directory: " + rel);
-            }
-            File parent = out.getParentFile();
-            if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
-                throw new IOException("cannot create " + parent);
-            }
+            File out = target(root, rel);
             File tmp = new File(out.getPath() + ".part");
             try (InputStream in = am.open("game/" + rel);
                  OutputStream os = new FileOutputStream(tmp)) {
@@ -140,15 +230,153 @@ final class GameFiles {
             if (tmp.length() != size) {
                 throw new IOException(rel + ": copied " + tmp.length() + " of " + size + " bytes");
             }
-            if (out.exists() && !out.delete()) {
-                throw new IOException("cannot replace " + out);
-            }
-            if (!tmp.renameTo(out)) {
-                throw new IOException("cannot rename " + tmp);
+            replace(tmp, out);
+        }
+        markInstalled(root, m);
+    }
+
+    /** Archiver leftovers, never part of a disc. */
+    private static boolean junk(String name) {
+        String low = name.toLowerCase(Locale.ROOT);
+        String base = low.substring(low.lastIndexOf('/') + 1);
+        return low.startsWith("__macosx/") || base.startsWith("._") || base.equals(".ds_store")
+                || base.equals("thumbs.db") || base.equals("desktop.ini");
+    }
+
+    /**
+     * The manifest key (lower-case path) an entry stands for, and the folder
+     * it is in: { key, "" } at the zip's root, { key, "Name/" } in one folder.
+     * folder: the one already seen (null until the first match).
+     */
+    private static String[] match(Map<String, JSONObject> want, String name, String folder) {
+        String low = name.toLowerCase(Locale.ROOT);
+        if ((folder == null || folder.isEmpty()) && want.containsKey(low)) {
+            return new String[] { low, "" };
+        }
+        int slash = name.indexOf('/');
+        if (slash > 0 && (folder == null || !folder.isEmpty())) {
+            String pre = name.substring(0, slash + 1);
+            String rest = low.substring(slash + 1);
+            if ((folder == null || folder.equals(pre)) && want.containsKey(rest)) {
+                return new String[] { rest, pre };
             }
         }
-        try (OutputStream os = new FileOutputStream(marker)) {
-            os.write(m.getString("id").getBytes(StandardCharsets.UTF_8));
+        return null;
+    }
+
+    private static String hex(byte[] d) {
+        StringBuilder sb = new StringBuilder(d.length * 2);
+        for (byte b : d) {
+            sb.append(String.format(Locale.ROOT, "%02x", b & 0xFF));
         }
+        return sb.toString();
+    }
+
+    /** External files: take the game's files from a zip, each one verified. */
+    static Imported importZip(Context c, InputStream raw, Progress p) throws Exception {
+        JSONObject m = manifest(c);
+        JSONArray list = m.getJSONArray("files");
+        long total = m.getLong("total_bytes");
+        String xbe = m.optString("default_xbe", "default.xbe");
+        Map<String, JSONObject> want = new HashMap<>();
+        long present = 0;
+        File root = gameDir(c);
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject f = list.getJSONObject(i);
+            want.put(f.getString("path").toLowerCase(Locale.ROOT), f);
+            File old = new File(root, f.getString("path"));
+            if (old.isFile()) {
+                present += old.length();        // replaced in place: no extra room needed
+            }
+        }
+        root = prepareRoot(c);
+        long need = total - present + (64L << 20);
+        long free = root.getUsableSpace();
+        if (free < need) {
+            throw new IOException(String.format(Locale.ROOT,
+                    "not enough free storage: the game's files need %.2f GB more, %.2f GB is free",
+                    need / 1e9, free / 1e9));
+        }
+        Set<String> done = new HashSet<>();
+        Imported r = new Imported();
+        MessageDigest sha = MessageDigest.getInstance("SHA-256");
+        byte[] buf = new byte[1 << 20];
+        try (ZipInputStream zin = new ZipInputStream(new BufferedInputStream(raw, 1 << 16),
+                                                     StandardCharsets.ISO_8859_1)) {
+            ZipEntry e;
+            while ((e = zin.getNextEntry()) != null) {
+                String name = e.getName().replace('\\', '/');
+                if (e.isDirectory() || name.isEmpty() || name.endsWith("/") || junk(name)) {
+                    continue;
+                }
+                String[] hit = match(want, name, r.folder);
+                if (hit == null) {
+                    r.ignored++;
+                    continue;
+                }
+                if (r.folder == null) {
+                    r.folder = hit[1];
+                }
+                JSONObject f = want.get(hit[0]);
+                String rel = f.getString("path");
+                if (!done.add(rel)) {
+                    throw new IOException("the zip holds " + rel + " twice");
+                }
+                long size = f.getLong("size");
+                File out = target(root, rel);
+                File tmp = new File(out.getPath() + ".part");
+                sha.reset();
+                long n = 0;
+                try (OutputStream os = new FileOutputStream(tmp)) {
+                    int k;
+                    while ((k = zin.read(buf)) > 0) {
+                        n += k;
+                        if (n > size) {
+                            break;
+                        }
+                        sha.update(buf, 0, k);
+                        os.write(buf, 0, k);
+                        r.bytes += k;
+                        if (p != null) {
+                            p.update(r.bytes, total, rel);
+                        }
+                    }
+                }
+                String got = n == size ? hex(sha.digest()) : null;
+                String expected = f.getString("sha256");
+                if (got == null || !got.equals(expected)) {
+                    //noinspection ResultOfMethodCallIgnored
+                    tmp.delete();
+                    String why = got == null
+                            ? String.format(Locale.ROOT, "%s bytes in the zip, the game's has %d",
+                                            n > size ? "more" : String.valueOf(n), size)
+                            : "SHA-256 " + got.substring(0, 16) + "..., expected "
+                              + expected.substring(0, 16) + "...";
+                    throw new IOException(rel + " in the zip is not the file this app was built from ("
+                            + why + ")" + (rel.equalsIgnoreCase(xbe)
+                            ? ": a different version or region of the game?" : ""));
+                }
+                replace(tmp, out);
+                r.files++;
+            }
+        } catch (ZipException ze) {
+            throw new IOException("cannot read the zip (" + ze.getMessage() + "). Make the zip with"
+                    + " ordinary compression (Deflate, most archivers' default) or none.", ze);
+        }
+        if (done.size() != list.length()) {
+            String first = null;
+            for (int i = 0; i < list.length() && first == null; i++) {
+                String path = list.getJSONObject(i).getString("path");
+                if (!done.contains(path)) {
+                    first = path;
+                }
+            }
+            throw new IOException(String.format(Locale.ROOT,
+                    "the zip lacks %d of the game's %d files (first: %s). It must hold the files"
+                    + " this app was built from, with %s at its root or in its one folder.",
+                    list.length() - done.size(), list.length(), first, xbe));
+        }
+        markInstalled(root, m);
+        return r;
     }
 }

@@ -632,21 +632,77 @@ class PipelineIntakeFlags(unittest.TestCase):
         self.assertEqual(self._run(work2, "--sha1", _sha1(self.img)), 0)
         self.assertTrue(os.path.lexists(os.path.join(work2, "input", "disc.iso")))
 
-    def test_game_too_large_for_an_apk_is_refused_early(self):
+    def _assets(self, app):
+        return os.path.join(app, "app", "src", "main", "assets")
+
+    def test_game_files_bundled_when_they_fit(self):
+        from tools.android import apk
+        work = os.path.join(self.tmp.name, "w")
+        self.assertEqual(self._run(work, "--sha1", _sha1(self.img)), 0)
+        self.assertTrue(self._json(work, "reports", "intake.json")["fits_in_apk"])
+        app = os.path.join(self.tmp.name, "app")
+        n, total, mode = apk.stage_assets(work, app, log=lambda *a: None)
+        self.assertEqual((n, mode), (len(FILES), "bundle"))
+        listed = self._json(self._assets(app), "xbr", "game_files.json")
+        self.assertTrue(listed["bundled"])
+        self.assertEqual(listed["default_xbe"], "default.xbe")
+        want = {k: hashlib.sha256(v).hexdigest() for k, v in FILES.items()}
+        self.assertEqual({f["path"]: f["sha256"] for f in listed["files"]}, want)
+        for rel, data in FILES.items():
+            with open(os.path.join(self._assets(app), "game", *rel.split("/")), "rb") as f:
+                self.assertEqual(f.read(), data)
+
+    def test_game_too_large_for_an_apk_goes_external(self):
         from tools.android import apk
         work = os.path.join(self.tmp.name, "w")
         self.assertEqual(self._run(work, "--sha1", _sha1(self.img)), 0)
         man_path = os.path.join(work, "game_manifest.json")
         man = self._json(man_path)
-        man["files"].append({"path": "huge.bin", "size": apk.APK_GAME_BYTES_MAX})
+        man["files"].append({"path": "huge.bin", "size": apk.APK_GAME_BYTES_MAX, "sha256": "ab" * 32})
         with open(man_path, "w", encoding="utf-8") as f:
             json.dump(man, f)
+        app = os.path.join(self.tmp.name, "app")
+        # A stale bundled copy from an earlier build must not stay in the APK.
+        stale = os.path.join(self._assets(app), "game", "default.xbe")
+        os.makedirs(os.path.dirname(stale))
+        open(stale, "wb").close()
+        n, total, mode = apk.stage_assets(work, app, log=lambda *a: None)
+        self.assertEqual((n, mode), (len(FILES) + 1, "external"))
+        self.assertFalse(os.path.exists(os.path.join(self._assets(app), "game")))
+        listed = self._json(self._assets(app), "xbr", "game_files.json")
+        self.assertFalse(listed["bundled"])
+        self.assertEqual(listed["total_bytes"], total)
+        self.assertEqual(listed["source"]["sha1"], _sha1(self.img))
+        self.assertTrue(all(len(f["sha256"]) == 64 for f in listed["files"]))
+        # Asked to bundle it anyway: refused, with the way out.
         with self.assertRaises(apk.ApkError) as cm:
-            apk.stage_assets(work, os.path.join(self.tmp.name, "app"), log=lambda *a: None)
-        self.assertIn("under 4 GiB", str(cm.exception))
-        self.assertTrue(self._json(work, "reports", "intake.json")["fits_in_apk"])
+            apk.stage_assets(work, app, log=lambda *a: None, mode="bundle")
+        self.assertIn("--game-files external", str(cm.exception))
+        # External on request, for a game that would fit.
+        self.assertEqual(apk.game_files_mode(10, "external"), "external")
+        self.assertEqual(apk.game_files_mode(10), "bundle")
+        with self.assertRaises(apk.ApkError):
+            apk.game_files_mode(10, "sideways")
 
-    def test_intake_warns_when_the_game_cannot_fit_an_apk(self):
+    def test_apk_game_file_checks(self):
+        from tools.android import apk
+        man = {"files": [{"path": "default.xbe", "size": 3, "sha256": "a" * 64},
+                         {"path": "data/x.bin", "size": 5, "sha256": "b" * 64}]}
+        listed = {"bundled": True, "files": [dict(f) for f in man["files"]]}
+        ok = apk.check_game_files({"assets/game/default.xbe": 3, "assets/game/data/x.bin": 5},
+                                  listed, man)
+        self.assertEqual((ok["mode"], ok["problems"]), ("bundle", []))
+        bad = apk.check_game_files({"assets/game/default.xbe": 4}, listed, man)
+        self.assertEqual((bad["missing"], bad["wrong_size"]), (1, 1))
+        ext = dict(listed, bundled=False)
+        self.assertEqual(apk.check_game_files({}, ext, man)["problems"], [])
+        r = apk.check_game_files({"assets/game/default.xbe": 3}, ext, man)
+        self.assertIn("holds 1 of them", r["problems"][0])
+        ext["files"][1]["sha256"] = "c" * 64     # a listing that would reject the right file
+        r = apk.check_game_files({}, ext, man)
+        self.assertEqual(r["unlisted"], 1)
+
+    def test_intake_says_when_the_game_cannot_fit_an_apk(self):
         from unittest import mock
         from tools.android import apk
         work = os.path.join(self.tmp.name, "w")
@@ -654,7 +710,7 @@ class PipelineIntakeFlags(unittest.TestCase):
             self.assertEqual(self._run(work, "--sha1", _sha1(self.img)), 0)   # still passes
         self.assertFalse(self._json(work, "reports", "intake.json")["fits_in_apk"])
         with open(os.path.join(work, "reports", "logs", "intake.log"), encoding="utf-8") as f:
-            self.assertIn("the apk stage will refuse them", f.read())
+            self.assertIn("imports them on the device from your zip", f.read())
 
     def test_zip_of_files_through_the_pipeline(self):
         z = _zip_files(os.path.join(self.tmp.name, "Game.zip"), FILES, prefix="Game/")

@@ -10,14 +10,17 @@ import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
+import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageView;
@@ -41,13 +44,21 @@ import java.util.ArrayList;
  * Launcher: installs the game files on first run, holds the options, starts
  * the game in its own process, and reports how the last run ended.
  *
+ * Game files too large for an APK are not in it (GameFiles): the first Play
+ * imports them from a zip of the game's files -- one placed in the app's own
+ * folder (Android/obb/&lt;package&gt;/game.zip, e.g. by adb), else one the
+ * user picks with the system file picker.
+ *
  * Automation: start with the boolean extra AUTOSTART to install and launch
  * without a tap (CI runs on an emulator use it), and a String[] extra ENV of
- * NAME=VALUE settings that are passed on to the runtime.
+ * NAME=VALUE settings that are passed on to the runtime. AUTOSTART never
+ * opens the picker; without a placed zip it logs that the files are needed.
  */
 public class LauncherActivity extends Activity {
     public static final String EXTRA_AUTOSTART = "org.xboxrecomp.app.AUTOSTART";
     public static final String EXTRA_ENV = "org.xboxrecomp.app.ENV";
+    private static final String TAG = "xboxrecomp";
+    private static final int REQ_ZIP = 1;
 
     private static final int BG = Color.rgb(0x10, 0x14, 0x18);
     private static final int CARD = Color.rgb(0x1B, 0x22, 0x29);
@@ -61,6 +72,7 @@ public class LauncherActivity extends Activity {
     private Button play;
     private boolean busy;
     private boolean gameStarted;
+    private boolean autostart;
     private String[] pendingEnv;
 
     @Override
@@ -91,7 +103,8 @@ public class LauncherActivity extends Activity {
             return;
         }
         pendingEnv = intent.getStringArrayExtra(EXTRA_ENV);
-        if (intent.getBooleanExtra(EXTRA_AUTOSTART, false)) {
+        autostart = intent.getBooleanExtra(EXTRA_AUTOSTART, false);
+        if (autostart) {
             start();
         }
     }
@@ -194,7 +207,8 @@ public class LauncherActivity extends Activity {
         status.setTextColor(MUTED);
         status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         status.setText(GameFiles.installed(this) ? getString(R.string.ready)
-                                                 : getString(R.string.first_run));
+                : GameFiles.bundled(this) ? getString(R.string.first_run)
+                : getString(R.string.first_run_external, GameFiles.describe(this)));
         col.addView(status);
         return root;
     }
@@ -336,36 +350,131 @@ public class LauncherActivity extends Activity {
             launchGame();
             return;
         }
+        if (GameFiles.bundled(this)) {
+            runJob(getString(R.string.installing), getString(R.string.install_failed), p -> {
+                GameFiles.install(this, p);
+                return null;
+            });
+            return;
+        }
+        final File placed = GameFiles.sideloadedZip(this);
+        if (placed != null) {
+            importFrom(placed.getPath(), () -> new FileInputStream(placed), placed);
+            return;
+        }
+        if (autostart) {
+            Log.i(TAG, "[FILES] game files needed: not in the APK, and no game.zip in "
+                    + getObbDir() + " or " + getExternalFilesDir(null));
+            status.setText(getString(R.string.first_run_external, GameFiles.describe(this)));
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(getString(R.string.files_needed_title))
+                .setMessage(getString(R.string.files_needed, GameFiles.describe(this)))
+                .setPositiveButton(getString(R.string.choose_zip), (d, w) -> pickZip())
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void pickZip() {
+        Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        pick.addCategory(Intent.CATEGORY_OPENABLE);
+        pick.setType("*/*");
+        pick.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
+                "application/zip", "application/x-zip-compressed", "application/octet-stream" });
+        try {
+            startActivityForResult(pick, REQ_ZIP);
+        } catch (Exception e) {
+            status.setText(getString(R.string.import_failed) + ": " + e.getMessage());
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != REQ_ZIP || result != RESULT_OK || data == null || data.getData() == null) {
+            return;
+        }
+        final Uri uri = data.getData();
+        importFrom(uri.toString(), () -> getContentResolver().openInputStream(uri), null);
+    }
+
+    private interface Source {
+        InputStream open() throws Exception;
+    }
+
+    /** Import the game files from a zip; placed: a zip in the app's own folder, removed after. */
+    private void importFrom(String what, Source source, File placed) {
+        Log.i(TAG, "[FILES] importing the game files (" + GameFiles.describe(this) + ") from " + what);
+        final long t0 = System.currentTimeMillis();
+        runJob(getString(R.string.importing), getString(R.string.import_failed), p -> {
+            GameFiles.Imported r;
+            try (InputStream in = source.open()) {
+                if (in == null) {
+                    throw new java.io.IOException("cannot open " + what);
+                }
+                r = GameFiles.importZip(this, in, p);
+            }
+            String line = String.format(java.util.Locale.ROOT,
+                    "[FILES] imported %d files, %d bytes from %s (%s), each matching its SHA-256,"
+                    + " in %.1fs; %d other zip entries ignored", r.files, r.bytes, what,
+                    r.folder == null || r.folder.isEmpty() ? "at the zip's root" : "in " + r.folder,
+                    (System.currentTimeMillis() - t0) / 1000.0, r.ignored);
+            Log.i(TAG, line);
+            if (placed != null && placed.delete()) {
+                Log.i(TAG, "[FILES] removed " + placed + " (imported)");
+            }
+            return line;
+        });
+    }
+
+    private interface Job {
+        Object run(GameFiles.Progress p) throws Exception;
+    }
+
+    /** Run a file job off the UI thread with progress, then start the game. */
+    private void runJob(String label, String failed, Job job) {
         busy = true;
         play.setEnabled(false);
         progress.setVisibility(View.VISIBLE);
-        status.setText(getString(R.string.installing));
+        status.setText(label);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         new Thread(() -> {
             try {
-                GameFiles.install(this, (done, total, file) -> {
+                job.run((done, total, file) -> {
                     final int permille = total > 0 ? (int) (done * 1000 / total) : 0;
                     ui.post(() -> {
                         progress.setProgress(permille);
-                        status.setText(String.format("%s  %d%%  %s",
-                                getString(R.string.installing), permille / 10, file));
+                        status.setText(String.format("%s  %d%%  %s", label, permille / 10, file));
                     });
                 });
                 ui.post(() -> {
-                    busy = false;
-                    play.setEnabled(true);
-                    progress.setVisibility(View.INVISIBLE);
+                    finishJob();
                     status.setText(getString(R.string.ready));
                     launchGame();
                 });
             } catch (Exception e) {
+                Log.i(TAG, "[FILES] " + failed + ": " + e.getMessage());
                 ui.post(() -> {
-                    busy = false;
-                    play.setEnabled(true);
-                    progress.setVisibility(View.INVISIBLE);
-                    status.setText(getString(R.string.install_failed) + ": " + e.getMessage());
+                    finishJob();
+                    status.setText(failed + ": " + e.getMessage());
+                    if (!autostart) {
+                        new AlertDialog.Builder(this)
+                                .setTitle(failed)
+                                .setMessage(e.getMessage())
+                                .setPositiveButton(android.R.string.ok, null)
+                                .show();
+                    }
                 });
             }
-        }, "xbr-install").start();
+        }, "xbr-files").start();
+    }
+
+    private void finishJob() {
+        busy = false;
+        play.setEnabled(true);
+        progress.setVisibility(View.INVISIBLE);
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
 
     private void launchGame() {

@@ -9,11 +9,20 @@ NDK-built libraries from <work>/out/lib/arm64-v8a and the game files from
 runs the pinned Gradle (`assembleRelease`). The APK is copied to
 <work>/out/<package>-<version>.apk; reports/apk_build.json says how.
 
+Game files (--game-files): "bundle" packs them into the APK; "external"
+leaves them out, and the launcher imports them on the device from the user's
+zip of the game's files (any zip whose files match). Either way
+assets/xbr/game_files.json lists every file with its size and SHA-256; an
+import checks each one, so only the exact files the code was recompiled from
+are accepted. "auto" (the default) bundles what fits: an APK must stay under
+4 GiB (apksigner has no ZIP64), so larger games are external.
+
 verify: opens the APK and checks what an install and a launch depend on --
 only arm64-v8a native code, libmain.so/libSDL2.so stored uncompressed and
 page-aligned and ELF64 AArch64 with the required symbols, the activities in
-the dex, every game file present with its size, the manifest's package and
-SDK levels (aapt2), the signature (apksigner). reports/apk_verify.json.
+the dex, every game file present with its size (bundled) or listed with its
+size and SHA-256 and absent (external), the manifest's package and SDK levels
+(aapt2), the signature (apksigner). reports/apk_verify.json.
 
 Signing: XBR_KEYSTORE / XBR_KEYSTORE_PASSWORD / XBR_KEY_ALIAS /
 XBR_KEY_PASSWORD name your release key. Without them a key is generated once
@@ -115,40 +124,69 @@ def _link_or_copy(src, dst):
         shutil.copyfile(src, dst)
 
 
-# The game files travel inside the APK. apksigner cannot sign a ZIP64 archive,
-# so the whole APK has to stay under 4 GiB; leave room for the libraries.
+# Bundled game files travel inside the APK. apksigner cannot sign a ZIP64
+# archive, so the whole APK has to stay under 4 GiB; leave room for the
+# libraries. Larger games go external (see the module docstring).
 APK_GAME_BYTES_MAX = 4 * 1024 ** 3 - 256 * 1024 ** 2
+GAME_FILES_MODES = ("auto", "bundle", "external")
 
 
-def stage_assets(work, app, log=print):
-    """assets/game <- <work>/game per the intake manifest; assets/xbr/game_files.json."""
+def game_files_mode(total_bytes, requested="auto"):
+    """"bundle" or "external" for a game of total_bytes, as requested."""
+    if requested not in GAME_FILES_MODES:
+        raise ApkError("--game-files must be one of %s" % ", ".join(GAME_FILES_MODES))
+    fits = total_bytes <= APK_GAME_BYTES_MAX
+    if requested == "bundle" and not fits:
+        raise ApkError("the game files are %.2f GiB; bundled in the APK they would take it past"
+                       " 4 GiB, which cannot be signed or installed (apksigner has no ZIP64)."
+                       " Use --game-files external (or auto): the launcher then imports them"
+                       " on the device from your zip." % (total_bytes / 1024.0 ** 3))
+    if requested == "auto":
+        return "bundle" if fits else "external"
+    return requested
+
+
+def stage_assets(work, app, log=print, mode="auto"):
+    """assets/xbr/game_files.json (every file's path, size and SHA-256), plus
+    assets/game <- <work>/game when the files are bundled. Returns (files,
+    bytes, mode)."""
     with open(os.path.join(work, "game_manifest.json"), encoding="utf-8") as f:
         man = json.load(f)
     need = sum(e["size"] for e in man["files"])
-    if need > APK_GAME_BYTES_MAX:
-        raise ApkError("the game files are %.2f GiB; they are packaged inside the APK, which"
-                       " must stay under 4 GiB to be signed and installed (apksigner has no"
-                       " ZIP64). Delivering larger games next to the APK is not implemented."
-                       % (need / 1024.0 ** 3))
+    mode = game_files_mode(need, mode)
     assets = os.path.join(app, "app", "src", "main", "assets")
     game = os.path.join(assets, "game")
     if os.path.exists(game):
         shutil.rmtree(game)
     files = []
     for e in sorted(man["files"], key=lambda e: e["path"]):
-        src = os.path.join(work, "game", e["path"])
-        dst = os.path.join(game, e["path"])
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        _link_or_copy(src, dst)
-        files.append({"path": e["path"], "size": e["size"]})
+        if not e.get("sha256"):
+            raise ApkError("game_manifest.json has no SHA-256 for %s (re-run intake)" % e["path"])
+        if mode == "bundle":
+            src = os.path.join(work, "game", e["path"])
+            dst = os.path.join(game, e["path"])
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            _link_or_copy(src, dst)
+        files.append({"path": e["path"], "size": e["size"], "sha256": e["sha256"]})
     listing = json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
     total = sum(f["size"] for f in files)
+    image = man.get("image") or {}
     os.makedirs(os.path.join(assets, "xbr"), exist_ok=True)
     with open(os.path.join(assets, "xbr", "game_files.json"), "w", encoding="utf-8") as f:
         json.dump({"id": hashlib.sha256(listing).hexdigest()[:32], "total_bytes": total,
+                   "file_count": len(files), "bundled": mode == "bundle",
+                   "default_xbe": man.get("default_xbe"),
+                   # What the user built from, for the launcher's import prompt.
+                   "source": {"kind": image.get("kind", "image"), "sha1": image.get("sha1"),
+                              "sha256": image.get("sha256")},
                    "files": files}, f, indent=1)
-    log("assets: %d game files, %d bytes" % (len(files), total))
-    return len(files), total
+    if mode == "bundle":
+        log("assets: %d game files, %d bytes, bundled in the APK" % (len(files), total))
+    else:
+        log("assets: %d game files, %d bytes (%.2f GiB), NOT in the APK: the launcher imports"
+            " them on the device from the zip of the game's files, checking each file's SHA-256"
+            % (len(files), total, total / 1024.0 ** 3))
+    return len(files), total, mode
 
 
 def ensure_key(app, java_home, log=print):
@@ -173,7 +211,7 @@ def ensure_key(app, java_home, log=print):
     return {"key": os.path.relpath(ks, app), "generated": True, "reused": False}
 
 
-def build(work, run=None, log=print):
+def build(work, run=None, log=print, game_files="auto"):
     run = run or native._default_run
     app = os.path.join(work, "project", "app")
     if not os.path.exists(os.path.join(app, "settings.gradle")):
@@ -198,7 +236,7 @@ def build(work, run=None, log=print):
         if not os.path.exists(src):
             raise ApkError("%s missing from out/lib/arm64-v8a" % n)
         shutil.copyfile(src, os.path.join(jni, n))
-    nfiles, nbytes = stage_assets(work, app, log)
+    nfiles, nbytes, mode = stage_assets(work, app, log, game_files)
     sdk = find_sdk()
     if not sdk:
         raise ApkError("no Android SDK (ANDROID_HOME) with platforms installed")
@@ -217,7 +255,8 @@ def build(work, run=None, log=print):
     shutil.copyfile(built, out)
     rep = {"ok": True, "apk": os.path.relpath(out, work), "size": os.path.getsize(out),
            "sha256": _sha256(out), "package": cfg["package"], "version": cfg["version_name"],
-           "game_files": nfiles, "game_bytes": nbytes, "signing": key,
+           "game_files": nfiles, "game_bytes": nbytes, "game_files_mode": mode,
+           "signing": key,
            "gradle": _lock()["gradle"]["version"],
            "agp": _lock()["gradle"]["android_gradle_plugin"],
            "seconds": round(time.time() - t0, 1)}
@@ -281,6 +320,40 @@ def _apksigner(apk):
             "cert_sha256": cert.group(1) if cert else None}, (None if r.returncode == 0 else r.stdout[-2000:])
 
 
+def check_game_files(sizes, listed, man):
+    """The APK's game files against the intake manifest. sizes: {entry name:
+    size} of the APK; listed: its assets/xbr/game_files.json. Bundled: every
+    file in assets/game with its size. External: none there. Both: every file
+    listed with its size and SHA-256 (what an import on the device checks)."""
+    bundled = listed.get("bundled", True)
+    problems, missing, wrong_size, unlisted = [], [], [], []
+    by_path = {f.get("path"): f for f in listed.get("files", [])}
+    for e in man["files"]:
+        entry = by_path.get(e["path"])
+        if not entry or entry.get("size") != e["size"] or entry.get("sha256") != e.get("sha256"):
+            unlisted.append(e["path"])
+        if bundled:
+            size = sizes.get("assets/game/" + e["path"])
+            if size is None:
+                missing.append(e["path"])
+            elif size != e["size"]:
+                wrong_size.append(e["path"])
+    if missing:
+        problems.append("%d game files missing from the APK (first: %s)" % (len(missing), missing[0]))
+    if wrong_size:
+        problems.append("%d game files have the wrong size (first: %s)" % (len(wrong_size), wrong_size[0]))
+    if unlisted:
+        problems.append("%d game files not listed with their size and SHA-256 in"
+                        " assets/xbr/game_files.json (first: %s)" % (len(unlisted), unlisted[0]))
+    packed = sum(1 for n in sizes if n.startswith("assets/game/"))
+    if not bundled and packed:
+        problems.append("the game files are meant to be imported on the device, but the APK"
+                        " holds %d of them" % packed)
+    return {"mode": "bundle" if bundled else "external", "expected": len(man["files"]),
+            "missing": len(missing), "wrong_size": len(wrong_size), "unlisted": len(unlisted),
+            "in_apk": packed, "problems": problems}
+
+
 def verify(work, apk=None, log=print):
     with open(os.path.join(work, "project", "xbr_game.json"), encoding="utf-8") as f:
         cfg = json.load(f)
@@ -333,17 +406,13 @@ def verify(work, apk=None, log=print):
             problems.append("dex lacks %s" % c)
     with open(os.path.join(work, "game_manifest.json"), encoding="utf-8") as f:
         man = json.load(f)
-    missing_files, wrong_size = [], []
-    for e in man["files"]:
-        info = names.get("assets/game/" + e["path"])
-        if not info:
-            missing_files.append(e["path"])
-        elif info.file_size != e["size"]:
-            wrong_size.append(e["path"])
-    if missing_files:
-        problems.append("%d game files missing from the APK (first: %s)" % (len(missing_files), missing_files[0]))
-    if wrong_size:
-        problems.append("%d game files have the wrong size (first: %s)" % (len(wrong_size), wrong_size[0]))
+    try:
+        listed = json.loads(zf.read("assets/xbr/game_files.json"))
+    except (KeyError, ValueError):
+        listed = {}
+    gf = check_game_files({n: i.file_size for n, i in names.items()}, listed, man)
+    problems += gf.pop("problems")
+    bundled = gf["mode"] == "bundle"
     for n in ("assets/xbr/game_files.json", "AndroidManifest.xml", "resources.arsc"):
         if n not in names:
             problems.append("%s missing" % n)
@@ -366,13 +435,13 @@ def verify(work, apk=None, log=print):
         notes.append("signature not checked: %s" % err)
     rep = {"ok": not problems, "apk": os.path.relpath(apk, work), "size": os.path.getsize(apk),
            "sha256": _sha256(apk), "abis": abis, "libraries": libs, "dex": dex,
-           "classes": classes, "game_files": {"expected": len(man["files"]),
-                                              "missing": len(missing_files),
-                                              "wrong_size": len(wrong_size)},
+           "classes": classes, "game_files": gf,
            "manifest": badging, "signature": sig, "problems": problems, "notes": notes}
     _write_json(os.path.join(work, "reports", "apk_verify.json"), rep)
     log("APK verify: %s; %s" % ("ok" if rep["ok"] else "FAILED", "; ".join(problems) or
-                               "abis %s, libs stored+aligned, %d game files" % (abis, len(man["files"]))))
+                               "abis %s, libs stored+aligned, %d game files %s" % (
+                                   abis, len(man["files"]),
+                                   "bundled" if bundled else "listed for import on the device")))
     if problems:
         raise ApkError("APK verification failed: " + "; ".join(problems))
     return rep
@@ -384,10 +453,13 @@ def main(argv=None):
     ap.add_argument("cmd", choices=["build", "verify"])
     ap.add_argument("--work", required=True)
     ap.add_argument("--apk")
+    ap.add_argument("--game-files", choices=GAME_FILES_MODES, default="auto",
+                    help="build: bundle the game files in the APK, or leave them for the"
+                         " launcher to import on the device (auto: bundle what fits)")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "build":
-            build(os.path.abspath(a.work))
+            build(os.path.abspath(a.work), game_files=a.game_files)
         else:
             verify(os.path.abspath(a.work), a.apk)
     except (ApkError, native.NativeError) as e:

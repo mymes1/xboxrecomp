@@ -29,7 +29,9 @@ says why):
   native     Android arm64-v8a: the NDK build (libmain.so + libSDL2.so,
              reports/native_build.json) or, with --native-mode check and no
              NDK, a compile-only check against bionic headers
-  apk        Gradle release build with the game files as assets
+  apk        Gradle release build; the game files as assets when they fit
+             (under 3.75 GiB), else listed for the launcher to import on the
+             device from your zip (--game-files auto|bundle|external)
   verify     APK structure, ABI, ELF machine, required symbols, signature
 
 Work directory layout:
@@ -153,14 +155,14 @@ def stage_intake(ctx):
     manifest["image"] = {k: info[k] for k in ("sha256", "sha1", "size", "source", "verified",
                                               "verified_with", "matched", "container", "kind")}
     manifest["detect"] = det
-    # The game files ride inside the APK (apk.stage_assets refuses more than
-    # this). Said now, not after the recompile and NDK build; those stages
-    # still run, since their reports are worth having for any game.
+    # Game files that cannot ride inside the APK (it must stay under 4 GiB)
+    # are imported on the device instead (apk.game_files_mode). Said now.
     fits = manifest["total_bytes"] <= apk.APK_GAME_BYTES_MAX
     if not fits:
-        ctx.log("WARNING: the game files are %.2f GiB; the apk stage will refuse them (they are"
-                " packaged inside the APK, which must stay under 4 GiB). The stages before it"
-                " still run." % (manifest["total_bytes"] / 1024.0 ** 3))
+        ctx.log("note: the game files are %.2f GiB, more than fits inside an APK; with"
+                " --game-files auto (the default) the APK is built without them and the launcher"
+                " imports them on the device from your zip of the game's files"
+                % (manifest["total_bytes"] / 1024.0 ** 3))
     if getattr(a, "drop_image", False):
         # A full-disc dump is several GB and nothing after intake reads it:
         # its digests are recorded here. Only the work directory's entry
@@ -338,11 +340,12 @@ def stage_native(ctx):
 
 def stage_apk(ctx):
     try:
-        r = apk.build(ctx.work, run=_native_run(ctx), log=ctx.log)
+        r = apk.build(ctx.work, run=_native_run(ctx), log=ctx.log,
+                      game_files=getattr(ctx.args, "game_files", "auto"))
     except (apk.ApkError, native.NativeError) as e:
         raise StageError(str(e))
     return {"apk": r["apk"], "size": r["size"], "sha256": r["sha256"],
-            "generated_key": r["signing"].get("generated")}
+            "game_files": r["game_files_mode"], "generated_key": r["signing"].get("generated")}
 
 
 def stage_verify(ctx):
@@ -419,6 +422,9 @@ def main(argv=None):
     r.add_argument("--drop-image", action="store_true",
                    help="intake: delete the work directory's copy of the image (or zip) once"
                         " it is verified and extracted (CI: a full-disc dump is several GB)")
+    r.add_argument("--game-files", choices=apk.GAME_FILES_MODES, default="auto",
+                   help="apk: bundle the game files in the APK, or leave them out for the launcher"
+                        " to import on the device from your zip (auto: bundle when they fit)")
     r.add_argument("--split", type=int, default=250, help="functions per generated C file")
     r.add_argument("--game-config", help="project: a profile JSON merged into xbr_game.json")
     r.add_argument("--host-seconds", type=int, default=20,

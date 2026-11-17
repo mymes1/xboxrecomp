@@ -143,6 +143,34 @@ jobs:
           diff build/games/xbrtest/project/xbr_game.json build/games/xbrtest-zip/project/xbr_game.json
           echo "zip of the files: same game files, generated code and configuration as the image"
 
+      # A game too large for an APK ships without its files; the launcher
+      # imports them on the device from the user's zip, checking each file's
+      # SHA-256. The same title built that way, for the emulator job.
+      - name: "Game files outside the APK (--game-files external), for the emulator"
+        env:
+          JAVA_HOME: ${{ env.JAVA_HOME_17_X64 }}
+        run: |
+          W=build/games/xbrtest-external
+          rm -rf $W && mkdir -p $W/out
+          cp -a build/games/xbrtest/project build/games/xbrtest/game build/games/xbrtest/reports \
+            build/games/xbrtest/game_manifest.json $W/
+          cp -a build/games/xbrtest/out/lib $W/out/
+          python3 -m tools.android.pipeline run --work $W --from apk --to verify --game-files external
+          cp build/zipcheck/xbrtest-files.zip $W/
+          ls -l build/games/xbrtest/out/*.apk $W/out/*.apk
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xbrtest-external-android-arm64
+          path: |
+            build/games/xbrtest-external/reports
+            build/games/xbrtest-external/out/*.apk
+            build/games/xbrtest-external/project/xbr_game.json
+            build/games/xbrtest-external/game_manifest.json
+            build/games/xbrtest-external/xbrtest-files.zip
+          if-no-files-found: warn
+
       - name: Report
         if: always()
         env:
@@ -178,6 +206,11 @@ jobs:
           name: xbrtest-android-arm64
           path: build/games/xbrtest
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: xbrtest-external-android-arm64
+          path: build/games/xbrtest-external
+
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -192,19 +225,27 @@ jobs:
           target: google_apis
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: python3 -m tools.android.device_run --work build/games/xbrtest --seconds 90 --touch --lifecycle --env RECOMP_AC97_READY=1 || echo "device run reported a failure"
+          # Second run: the APK without its game files; they are imported from
+          # a zip pushed to the app's OBB folder, then the title must boot.
+          script: |
+            python3 -m tools.android.device_run --work build/games/xbrtest --seconds 90 --touch --lifecycle --env RECOMP_AC97_READY=1 || echo "device run reported a failure"
+            python3 -m tools.android.device_run --work build/games/xbrtest-external --seconds 60 --game-zip build/games/xbrtest-external/xbrtest-files.zip || echo "device run (game files imported from a zip) reported a failure"
 
       - name: Report
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -m tools.android.ci_report --work build/games/xbrtest --name emulator --post
+        run: |
+          python3 -m tools.android.ci_report --work build/games/xbrtest --name emulator --post
+          python3 -m tools.android.ci_report --work build/games/xbrtest-external --name emulator-external-files --post
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: xbrtest-emulator
-          path: build/games/xbrtest/reports
+          path: |
+            build/games/xbrtest/reports
+            build/games/xbrtest-external/reports
           if-no-files-found: warn
 
   linux-arm64:

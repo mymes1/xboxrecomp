@@ -3,7 +3,7 @@ happened: reports/runtime_test.json, the evidence for "Runtime initialized"
 and "Game booted" in the compatibility report.
 
     python3 -m tools.android.device_run --work W [--seconds 60] [--serial S]
-                                        [--lifecycle] [--touch]
+                                        [--lifecycle] [--touch] [--game-zip Z]
 
 Installs <work>/out/<package>-<version>.apk, clears logcat, starts the
 launcher with AUTOSTART (it installs the game files and starts the game in
@@ -24,6 +24,13 @@ drives the on-screen controller with `input swipe` at the positions it logs
 ("[TOUCH] layout ...") and checks controller port 0 reports each control
 (RECOMP_INPUT_TRACE: "[INPUT] port 0: ..."): A held, the left stick pushed
 up and right, Start.
+
+--game-zip, for an APK built with its game files left out (apk.py
+--game-files external): the app's data is cleared so nothing is left from an
+earlier install, the zip of the game's files is pushed to the app's OBB
+folder (Android/obb/<package>/game.zip, where the launcher looks before it
+offers the file picker), and the launcher's "[FILES] imported ..." line --
+every file matched its SHA-256 -- is required (files_import in the report).
 """
 
 import argparse
@@ -214,8 +221,17 @@ def _lifecycle(adb, serial, pkg, log, selftest):
     return out
 
 
+def parse_files_lines(text):
+    """The launcher's [FILES] lines: game file installation or import."""
+    lines = [l.strip() for l in text.splitlines() if l.strip().startswith("[FILES]")]
+    imported = [l for l in lines if l.startswith("[FILES] imported ")]
+    failed = [l for l in lines if "failed" in l or "needed" in l]
+    return {"ok": bool(imported) and not failed, "imported": imported[-1] if imported else None,
+            "problems": failed[-5:], "lines": lines[-12:]}
+
+
 def run(work, seconds=60, serial=None, extra_env=None, log=print, lifecycle=False,
-        touch=False):
+        touch=False, game_zip=None):
     with open(os.path.join(work, "project", "xbr_game.json"), encoding="utf-8") as f:
         cfg = json.load(f)
     apk = os.path.join(work, "out", "%s-%s.apk" % (cfg["package"], cfg["version_name"]))
@@ -253,6 +269,17 @@ def run(work, seconds=60, serial=None, extra_env=None, log=print, lifecycle=Fals
         rep["exit"] = "install failed"
         _finish(work, rep, log)
         raise DeviceError("install failed: %s" % install.strip()[-500:])
+
+    if game_zip:
+        # A clean start, so the files can only come from the zip.
+        adb.cmd("shell", "pm", "clear", pkg, check=False)
+        adb.cmd("shell", "rm", "-rf", "/sdcard/Android/data/%s/files/game" % pkg, check=False)
+        obb = "/sdcard/Android/obb/%s" % pkg
+        adb.cmd("shell", "mkdir", "-p", obb, check=False)
+        pushed = adb.cmd("push", game_zip, obb + "/game.zip", check=False, timeout=3600)
+        rep["game_zip"] = {"file": os.path.basename(game_zip), "size": os.path.getsize(game_zip),
+                           "pushed_to": obb + "/game.zip", "push": pushed.strip()[-300:]}
+        log("game files: %s pushed to %s/game.zip for the launcher to import" % (game_zip, obb))
 
     adb.cmd("logcat", "-c", check=False)
     env = ["RECOMP_STATUS_SECS=2", "RECOMP_STATUS_BMP=display.bmp",
@@ -294,6 +321,12 @@ def run(work, seconds=60, serial=None, extra_env=None, log=print, lifecycle=Fals
         f.write(full[-4_000_000:])
     parsed = native.parse_boot_log(text)
     rep.update(parsed)
+    files = parse_files_lines(text)
+    if game_zip or files["lines"]:
+        rep["files_import" if game_zip else "files_install"] = files
+    if game_zip and not files["ok"]:
+        log("game files: NOT imported from the zip: %s" % ("; ".join(files["problems"]) or
+                                                          "no [FILES] imported line"))
     if screen is not None:
         rep["screen_check"] = screen
     if touch_rep is not None:
@@ -355,10 +388,16 @@ def main(argv=None):
                     help="send the app to the background and back, and check it survives")
     ap.add_argument("--touch", action="store_true",
                     help="drive the on-screen controller and check controller port 0 sees it")
+    ap.add_argument("--game-zip",
+                    help="a zip of the game's files, for an APK built without them: pushed to the"
+                         " app's OBB folder for the launcher to import (and checked that it did)")
     a = ap.parse_args(argv)
     try:
-        run(os.path.abspath(a.work), a.seconds, a.serial, a.env, lifecycle=a.lifecycle,
-            touch=a.touch)
+        rep = run(os.path.abspath(a.work), a.seconds, a.serial, a.env, lifecycle=a.lifecycle,
+                  touch=a.touch, game_zip=a.game_zip)
+        if a.game_zip and not rep.get("files_import", {}).get("ok"):
+            print("error: the game files were not imported from %s" % a.game_zip, file=sys.stderr)
+            return 1
     except DeviceError as e:
         print("error: %s" % e, file=sys.stderr)
         return 1

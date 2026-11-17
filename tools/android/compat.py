@@ -120,7 +120,7 @@ def _host_summary(r):
         return None
     keep = ("platform", "entry_reached", "title_returned", "exit", "seconds", "flips",
             "display_changes", "display_set", "selftest", "display_bmp", "log", "failed_step", "note",
-            "render", "present", "audio", "usb")
+            "render", "present", "audio", "usb", "files_import")
     out = {k: r.get(k) for k in keep if k in r}
     out["crash"] = r.get("crash", [])[:20]
     out["unimpl_reached"] = r.get("unimpl", [])[:20]
@@ -196,9 +196,22 @@ def to_markdown(r):
             out.append("- `%s`: %s, %s bytes, %s" % (lib.get("name"), lib.get("machine"),
                                                      lib.get("size"), lib.get("tls", "")))
         out.append("")
+    gf = (r.get("apk") or {}).get("game_files") or {}
+    if gf.get("mode"):
+        out.append("## APK")
+        out.append("- game files: %s" % (
+            "bundled in the APK (%d files)" % gf.get("expected", 0) if gf["mode"] == "bundle" else
+            "not in the APK (%d files listed with their SHA-256): the launcher imports them on the"
+            " device from the user's zip of the game's files" % gf.get("expected", 0)))
+        out.append("")
     rt = r.get("runtime_test")
     if rt:
         out.append("## Runtime test on %s (%s)" % (rt.get("platform", "?"), rt.get("execution", "?")))
+        fi = rt.get("files_import")
+        if fi:
+            out.append("- game files imported on the device: %s" % (
+                fi.get("imported") if fi.get("ok") else
+                "FAILED (%s)" % ("; ".join(fi.get("problems") or []) or "no import line")))
         for k in ("device", "entry_reached", "flips", "display_changes", "exit", "selftest"):
             if k in rt:
                 out.append("- %s: %s" % (k, rt.get(k)))

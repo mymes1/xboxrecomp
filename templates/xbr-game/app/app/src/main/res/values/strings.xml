@@ -10,6 +10,12 @@
     <string name="first_run">The game files are installed on the first start.</string>
     <string name="installing">Installing game files</string>
     <string name="install_failed">Installing the game files failed</string>
+    <string name="first_run_external">The game\'s files (%1$s) are not inside this app: tap Play and choose the zip of the game\'s files.</string>
+    <string name="files_needed_title">Game files needed</string>
+    <string name="files_needed">The game\'s files (%1$s) are too large to fit inside an app, so they are imported once from your zip of the game\'s files: default.xbe at its root, or in its one folder. Every file is checked against the ones this app was recompiled from.</string>
+    <string name="choose_zip">Choose zip</string>
+    <string name="importing">Importing game files</string>
+    <string name="import_failed">Importing the game files failed</string>
     <string name="ended">The game ended normally.</string>
     <string name="crashed">The game stopped unexpectedly. The log below says where.</string>
     <string name="no_log">No log yet: the game has not been started.</string>
